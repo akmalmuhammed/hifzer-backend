@@ -7,7 +7,7 @@ services:
     autoDeploy: true
     buildCommand: pnpm install --frozen-lockfile && pnpm prisma generate && pnpm build
     startCommand: pnpm prisma migrate deploy && pnpm start
-    healthCheckPath: /health
+    healthCheckPath: /health/live
     envVars:
       - key: NODE_VERSION
         value: 20
@@ -29,5 +29,13 @@ services:
         value: "30"
       - key: REFRESH_TOKEN_PEPPER
         sync: false
+      - key: LOG_LEVEL
+        value: info
+      - key: SENTRY_DSN
+        sync: false
+      - key: SENTRY_ENVIRONMENT
+        value: production
+      - key: SENTRY_TRACES_SAMPLE_RATE
+        value: "0.1"
       - key: AYAHS_SEED_PATH
         value: ./prisma/seeds/ayahs.template.json

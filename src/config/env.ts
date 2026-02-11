@@ -5,6 +5,7 @@ config();
 
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+  LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
   PORT: z.coerce.number().int().positive().default(4000),
   DATABASE_URL: z
     .string()
@@ -15,6 +16,13 @@ const envSchema = z.object({
   JWT_ACCESS_TTL: z.string().default("15m"),
   JWT_REFRESH_TTL_DAYS: z.coerce.number().int().positive().default(30),
   REFRESH_TOKEN_PEPPER: z.string().min(8).default("replace_me_refresh_pepper"),
+  SENTRY_DSN: z.string().default(""),
+  SENTRY_ENVIRONMENT: z.string().default(""),
+  SENTRY_TRACES_SAMPLE_RATE: z.coerce.number().min(0).max(1).default(0.1),
+  PRISMA_QUERY_LOGS: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
   CLERK_AUTH_ENABLED: z
     .enum(["true", "false"])
     .default("false")

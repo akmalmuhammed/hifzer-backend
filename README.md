@@ -91,6 +91,38 @@ Required CORS env for frontend access:
 - `CORS_ORIGINS=https://hifzer-frontend.vercel.app`
 - Multiple origins can be comma-separated (for example include localhost in development).
 
+## Observability (Error Tracking + Logs + Uptime)
+
+This backend now includes:
+
+- Structured request logging via `pino-http` with `x-request-id` correlation
+- Error-level Prisma logging (optional full query logging)
+- Optional Sentry exception + trace capture
+- Liveness and readiness probes
+
+### Environment variables
+
+- `LOG_LEVEL=info`
+- `SENTRY_DSN=`
+- `SENTRY_ENVIRONMENT=production`
+- `SENTRY_TRACES_SAMPLE_RATE=0.1`
+- `PRISMA_QUERY_LOGS=false`
+
+### Health endpoints
+
+- `GET /health/live` (process liveness)
+- `GET /health/ready` (DB readiness)
+- `GET /health` (legacy combined check)
+
+### Uptime monitors (recommended)
+
+Create monitors for:
+
+1. `https://hifzer-backend.onrender.com/health/live`
+2. `https://hifzer-backend.onrender.com/health/ready`
+
+Alert target: email + Slack/Discord webhook. Trigger on 2 consecutive failures.
+
 ## Clerk Auth Migration (Optional)
 
 This backend supports dual auth modes:

@@ -39,6 +39,7 @@
   },
   "dependencies": {
     "@prisma/client": "^6.16.2",
+    "@sentry/node": "^10.38.0",
     "argon2": "^0.44.0",
     "bullmq": "^5.67.3",
     "cookie-parser": "^1.4.7",
