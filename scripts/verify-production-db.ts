@@ -1,6 +1,9 @@
 import { PrismaClient } from "@prisma/client";
 
-const prisma = new PrismaClient();
+const dbUrlForOps = process.env.DIRECT_URL || process.env.DATABASE_URL;
+const prisma = dbUrlForOps
+  ? new PrismaClient({ datasources: { db: { url: dbUrlForOps } } })
+  : new PrismaClient();
 
 const EXPECTED_AYAHS_COUNT = 6236;
 const EXPECTED_MIGRATIONS = [

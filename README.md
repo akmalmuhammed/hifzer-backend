@@ -93,7 +93,12 @@ Required CORS env for frontend access:
 
 ## Production Database Operations
 
-These commands assume `DATABASE_URL` points to production (Neon).
+These commands assume production DB env vars are set.
+
+For Neon, use:
+
+- `DATABASE_URL`: pooled URL (typically `-pooler` host) for app/runtime.
+- `DIRECT_URL`: non-pooled direct URL for migrations and bulk ops.
 
 1. Confirm migration status:
 
@@ -104,7 +109,7 @@ pnpm prisma:status
 2. Apply pending migrations:
 
 ```bash
-pnpm prisma:deploy
+pnpm prisma:deploy:prod
 ```
 
 3. Seed full Qur'an dataset (6,236 ayahs):
@@ -122,6 +127,14 @@ pnpm db:verify
 5. Run all three in order:
 
 ```bash
+pnpm ops:prod:prepare
+```
+
+PowerShell example:
+
+```powershell
+$env:DATABASE_URL='postgresql://<user>:<password>@<pooler-host>/<db>?sslmode=require&channel_binding=require'
+$env:DIRECT_URL='postgresql://<user>:<password>@<direct-host>/<db>?sslmode=require&channel_binding=require'
 pnpm ops:prod:prepare
 ```
 

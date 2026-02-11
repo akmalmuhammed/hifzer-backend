@@ -13,13 +13,14 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
+    "prisma:deploy:prod": "tsx scripts/deploy-migrations.ts",
     "prisma:status": "prisma migrate status",
     "seed:metadata": "tsx scripts/build-ayah-metadata-from-quran-data.ts",
     "seed:build": "tsx scripts/build-canonical-ayah-seed.ts",
     "seed": "tsx prisma/seed.ts",
     "seed:full": "tsx prisma/seed-full.ts",
     "db:verify": "tsx scripts/verify-production-db.ts",
-    "ops:prod:prepare": "pnpm prisma:deploy && pnpm seed:full && pnpm db:verify",
+    "ops:prod:prepare": "pnpm prisma:deploy:prod && pnpm seed:full && pnpm db:verify",
     "worker": "tsx src/queues/reducerWorker.ts"
   },
   "keywords": [

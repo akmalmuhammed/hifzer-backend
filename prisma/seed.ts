@@ -3,7 +3,10 @@ import path from "node:path";
 import { PrismaClient } from "@prisma/client";
 import { z } from "zod";
 
-const prisma = new PrismaClient();
+const dbUrlForOps = process.env.DIRECT_URL || process.env.DATABASE_URL;
+const prisma = dbUrlForOps
+  ? new PrismaClient({ datasources: { db: { url: dbUrlForOps } } })
+  : new PrismaClient();
 
 const ayahSchema = z.object({
   id: z.number().int().positive(),
