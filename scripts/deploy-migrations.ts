@@ -1,25 +1,28 @@
-import { spawn } from "node:child_process";
+import { execSync } from "node:child_process";
+import { config } from "dotenv";
 
-const command = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
-const args = ["prisma", "migrate", "deploy"];
+config();
 
-const env = {
-  ...process.env,
-  // For Neon, CLI migrations are more stable on non-pooled connections.
-  DATABASE_URL: process.env.DIRECT_URL || process.env.DATABASE_URL
-};
+// For Neon, CLI migrations are more stable on non-pooled connections.
+const dbUrlForOps = process.env.DIRECT_URL || process.env.DATABASE_URL;
 
-const child = spawn(command, args, {
-  stdio: "inherit",
-  env
-});
+if (!dbUrlForOps) {
+  // eslint-disable-next-line no-console
+  console.error("DATABASE_URL or DIRECT_URL is required");
+  process.exit(1);
+}
 
-child.on("error", (error) => {
+try {
+  execSync("pnpm prisma migrate deploy", {
+    stdio: "inherit",
+    shell: true,
+    env: {
+      ...process.env,
+      DATABASE_URL: dbUrlForOps
+    }
+  });
+} catch (error) {
   // eslint-disable-next-line no-console
   console.error(error);
   process.exit(1);
-});
-
-child.on("exit", (code) => {
-  process.exit(code ?? 1);
-});
+}
