@@ -27,7 +27,7 @@
   "license": "MIT",
   "type": "commonjs",
   "engines": {
-    "node": ">=20"
+    "node": "20.x"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"
