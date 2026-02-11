@@ -86,6 +86,44 @@ Quick steps:
    - `REFRESH_TOKEN_PEPPER`
 4. Deploy and verify `GET /health`.
 
+## Production Database Operations
+
+These commands assume `DATABASE_URL` points to production (Neon).
+
+1. Confirm migration status:
+
+```bash
+pnpm prisma:status
+```
+
+2. Apply pending migrations:
+
+```bash
+pnpm prisma:deploy
+```
+
+3. Seed full Qur'an dataset (6,236 ayahs):
+
+```bash
+pnpm seed:full
+```
+
+4. Verify production DB state (ayah row count + migration set):
+
+```bash
+pnpm db:verify
+```
+
+5. Run all three in order:
+
+```bash
+pnpm ops:prod:prepare
+```
+
+Neon backup/PITR runbook:
+
+- `NEON_BACKUP.md`
+
 ## Seed data notes
 
 - Local-only seed, no network fetch.
