@@ -91,6 +91,26 @@ Required CORS env for frontend access:
 - `CORS_ORIGINS=https://hifzer-frontend.vercel.app`
 - Multiple origins can be comma-separated (for example include localhost in development).
 
+## Clerk Auth Migration (Optional)
+
+This backend supports dual auth modes:
+
+- Legacy local JWT (`/api/v1/auth/*`)
+- Clerk bearer tokens (`Authorization: Bearer <clerk-session-jwt>`)
+
+Enable Clerk mode with env vars:
+
+- `CLERK_AUTH_ENABLED=true`
+- `CLERK_JWKS_URL=<your-clerk-jwks-url>`
+- `CLERK_JWT_ISSUER=<optional-issuer>`
+- `CLERK_JWT_AUDIENCE=<optional-aud-1,aud-2>`
+
+Notes:
+
+- When Clerk auth is enabled, protected API routes accept valid Clerk JWTs.
+- A local `User` row is auto-provisioned on first authenticated Clerk request.
+- Existing local auth endpoints remain available for compatibility.
+
 ## Production Database Operations
 
 These commands assume production DB env vars are set.

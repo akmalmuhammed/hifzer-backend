@@ -15,6 +15,21 @@ const envSchema = z.object({
   JWT_ACCESS_TTL: z.string().default("15m"),
   JWT_REFRESH_TTL_DAYS: z.coerce.number().int().positive().default(30),
   REFRESH_TOKEN_PEPPER: z.string().min(8).default("replace_me_refresh_pepper"),
+  CLERK_AUTH_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
+  CLERK_JWKS_URL: z.string().default(""),
+  CLERK_JWT_ISSUER: z.string().default(""),
+  CLERK_JWT_AUDIENCE: z
+    .string()
+    .default("")
+    .transform((value) =>
+      value
+        .split(",")
+        .map((part) => part.trim())
+        .filter((part) => part.length > 0)
+    ),
   CORS_ORIGINS: z
     .string()
     .default("http://localhost:3000,http://127.0.0.1:3000,https://hifzer-frontend.vercel.app")
