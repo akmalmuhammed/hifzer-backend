@@ -15,6 +15,15 @@ const envSchema = z.object({
   JWT_ACCESS_TTL: z.string().default("15m"),
   JWT_REFRESH_TTL_DAYS: z.coerce.number().int().positive().default(30),
   REFRESH_TOKEN_PEPPER: z.string().min(8).default("replace_me_refresh_pepper"),
+  CORS_ORIGINS: z
+    .string()
+    .default("http://localhost:3000,http://127.0.0.1:3000,https://hifzer-frontend.vercel.app")
+    .transform((value) =>
+      value
+        .split(",")
+        .map((origin) => origin.trim().replace(/\/+$/, ""))
+        .filter((origin) => origin.length > 0)
+    ),
   PROCESS_EVENTS_INLINE: z
     .enum(["true", "false"])
     .default("true")

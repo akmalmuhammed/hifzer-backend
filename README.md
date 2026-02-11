@@ -86,6 +86,11 @@ Quick steps:
    - `REFRESH_TOKEN_PEPPER`
 4. Deploy and verify `GET /health`.
 
+Required CORS env for frontend access:
+
+- `CORS_ORIGINS=https://hifzer-frontend.vercel.app`
+- Multiple origins can be comma-separated (for example include localhost in development).
+
 ## Production Database Operations
 
 These commands assume `DATABASE_URL` points to production (Neon).
