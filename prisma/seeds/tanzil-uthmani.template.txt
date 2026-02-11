@@ -1,0 +1,5 @@
+# Tanzil Uthmani source template.
+# Expected format per line: surah|ayah|text
+# Replace this file with the full Tanzil Uthmani text export.
+1|1|BISMILLAH_PLACEHOLDER
+1|2|ALHAMDU_LILLAH_PLACEHOLDER

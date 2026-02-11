@@ -1,0 +1,317 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TajwidConfidence {
+  LOW
+  MED
+  HIGH
+}
+
+enum GoalType {
+  SURAH
+  JUZ
+  FULL_QURAN
+}
+
+enum ProgramVariant {
+  MOMENTUM
+  STANDARD
+  CONSERVATIVE
+}
+
+enum PriorJuzBand {
+  ZERO
+  ONE_TO_FIVE
+  FIVE_PLUS
+}
+
+enum ScaffoldingLevel {
+  BEGINNER
+  STANDARD
+  MINIMAL
+}
+
+enum QueueMode {
+  NORMAL
+  REVIEW_ONLY
+  CONSOLIDATION
+}
+
+enum ItemStatus {
+  LEARNING
+  MEMORIZED
+  REVIEWING
+  PAUSED
+}
+
+enum ReviewTier {
+  SABAQ
+  SABQI
+  MANZIL
+}
+
+enum ReviewEventType {
+  REVIEW_ATTEMPTED
+  TRANSITION_ATTEMPTED
+}
+
+enum SessionStatus {
+  ACTIVE
+  COMPLETED
+  ABANDONED
+}
+
+enum FluencyGateStatus {
+  IN_PROGRESS
+  PASSED
+  FAILED
+}
+
+enum ReviewSessionType {
+  SABAQ
+  SABQI
+  MANZIL
+  WARMUP
+}
+
+enum ReviewStepType {
+  EXPOSURE
+  GUIDED
+  BLIND
+  LINK
+}
+
+model User {
+  id                          String           @id @default(uuid()) @db.Uuid
+  email                       String           @unique
+  passwordHash                String
+  refreshTokenVersion         Int              @default(0)
+  timeBudgetMinutes           Int              @default(60)
+  fluencyScore                Int?
+  fluencyGatePassed           Boolean          @default(false)
+  requiresPreHifz             Boolean          @default(true)
+  tajwidConfidence            TajwidConfidence @default(MED)
+  goal                        GoalType         @default(FULL_QURAN)
+  hasTeacher                  Boolean          @default(false)
+  priorJuzBand                PriorJuzBand     @default(ZERO)
+  scaffoldingLevel            ScaffoldingLevel @default(STANDARD)
+  variant                     ProgramVariant   @default(STANDARD)
+  dailyNewTargetAyahs         Int              @default(7)
+  reviewRatioTarget           Int              @default(70)
+  retentionThreshold          Float            @default(0.85)
+  backlogFreezeRatio          Float            @default(0.8)
+  consolidationRetentionFloor Float            @default(0.75)
+  manzilRotationDays          Int              @default(30)
+  avgSecondsPerItem           Int              @default(75)
+  overdueCapSeconds           Int              @default(172800)
+  createdAt                   DateTime         @default(now())
+  updatedAt                   DateTime         @updatedAt
+
+  itemStates       UserItemState[]
+  reviewEvents     ReviewEvent[]
+  dailySessions    DailySession[]
+  sessionRuns      SessionRun[]
+  refreshTokens    RefreshToken[]
+  transitionScores TransitionScore[]
+  fluencyTests     FluencyGateTest[]
+}
+
+model RefreshToken {
+  id                 String        @id @default(uuid()) @db.Uuid
+  userId             String        @db.Uuid
+  tokenHash          String
+  deviceId           String?
+  userAgent          String?
+  ipAddress          String?
+  expiresAt          DateTime
+  revokedAt          DateTime?
+  rotatedFromTokenId String?       @db.Uuid
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  rotatedFrom RefreshToken? @relation("RefreshTokenRotation", fields: [rotatedFromTokenId], references: [id], onDelete: SetNull)
+  rotatedTo   RefreshToken[] @relation("RefreshTokenRotation")
+
+  @@index([userId, expiresAt])
+  @@index([userId, revokedAt])
+}
+
+model Ayah {
+  id          Int      @id
+  surahNumber Int
+  ayahNumber  Int
+  juzNumber   Int
+  pageNumber  Int
+  hizbQuarter Int?
+  textUthmani String?
+  createdAt   DateTime @default(now())
+
+  itemStates         UserItemState[]
+  reviewEventsAsItem ReviewEvent[]     @relation("ReviewEventItemAyah")
+  reviewEventsAsFrom ReviewEvent[]     @relation("ReviewEventFromAyah")
+  reviewEventsAsTo   ReviewEvent[]     @relation("ReviewEventToAyah")
+  reviewEventsLinked ReviewEvent[]     @relation("ReviewEventLinkedAyah")
+  transitionsFrom    TransitionScore[] @relation("TransitionFromAyah")
+  transitionsTo      TransitionScore[] @relation("TransitionToAyah")
+
+  @@unique([surahNumber, ayahNumber])
+  @@index([juzNumber])
+  @@index([pageNumber])
+}
+
+model UserItemState {
+  id                      String     @id @default(uuid()) @db.Uuid
+  userId                  String     @db.Uuid
+  ayahId                  Int
+  status                  ItemStatus @default(LEARNING)
+  tier                    ReviewTier @default(SABAQ)
+  nextReviewAt            DateTime
+  reviewIntervalSeconds   Int
+  intervalCheckpointIndex Int        @default(0)
+  introducedAt            DateTime   @default(now())
+  firstMemorizedAt        DateTime?
+  difficultyScore         Float      @default(0)
+  totalReviews            Int        @default(0)
+  successfulReviews       Int        @default(0)
+  lapses                  Int        @default(0)
+  successStreak           Int        @default(0)
+  consecutivePerfectDays  Int        @default(0)
+  averageDurationSeconds  Int        @default(0)
+  lastErrorsCount         Int        @default(0)
+  lastReviewedAt          DateTime?
+  lastEventOccurredAt     DateTime?
+  createdAt               DateTime   @default(now())
+  updatedAt               DateTime   @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ayah Ayah @relation(fields: [ayahId], references: [id], onDelete: Restrict)
+
+  @@unique([userId, ayahId])
+  @@index([userId, nextReviewAt])
+  @@index([userId, tier, nextReviewAt])
+  @@index([userId, lastReviewedAt])
+}
+
+model SessionRun {
+  id              String        @id @default(uuid()) @db.Uuid
+  userId          String        @db.Uuid
+  clientSessionId String?       @db.Uuid
+  mode            QueueMode
+  warmupPassed    Boolean?
+  status          SessionStatus @default(ACTIVE)
+  startedAt       DateTime      @default(now())
+  endedAt         DateTime?
+  minutesTotal    Int           @default(0)
+  eventsCount     Int           @default(0)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  user   User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  events ReviewEvent[]
+
+  @@unique([userId, clientSessionId])
+  @@index([userId, status, startedAt])
+  @@index([userId, startedAt])
+}
+
+model ReviewEvent {
+  id              BigInt          @id @default(autoincrement())
+  userId          String          @db.Uuid
+  sessionRunId    String?         @db.Uuid
+  clientEventId   String          @db.Uuid
+  eventType       ReviewEventType
+  sessionType     ReviewSessionType @default(SABAQ)
+  itemAyahId      Int?
+  tier            ReviewTier?
+  stepType        ReviewStepType?
+  attemptNumber   Int?
+  scaffoldingUsed Boolean         @default(false)
+  linkedAyahId    Int?
+  success         Boolean?
+  errorsCount     Int?
+  durationSeconds Int?
+  errorTags       Json?
+  fromAyahId      Int?
+  toAyahId        Int?
+  occurredAt      DateTime
+  receivedAt      DateTime        @default(now())
+
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessionRun SessionRun? @relation(fields: [sessionRunId], references: [id], onDelete: SetNull)
+  itemAyah   Ayah?      @relation("ReviewEventItemAyah", fields: [itemAyahId], references: [id], onDelete: SetNull)
+  fromAyah   Ayah?      @relation("ReviewEventFromAyah", fields: [fromAyahId], references: [id], onDelete: SetNull)
+  toAyah     Ayah?      @relation("ReviewEventToAyah", fields: [toAyahId], references: [id], onDelete: SetNull)
+  linkedAyah Ayah?      @relation("ReviewEventLinkedAyah", fields: [linkedAyahId], references: [id], onDelete: SetNull)
+
+  @@unique([userId, clientEventId])
+  @@index([userId, occurredAt])
+  @@index([userId, eventType, occurredAt])
+  @@index([userId, itemAyahId, occurredAt])
+  @@index([userId, fromAyahId, toAyahId, occurredAt])
+  @@index([userId, stepType, occurredAt])
+}
+
+model DailySession {
+  id                     String    @id @default(uuid()) @db.Uuid
+  userId                 String    @db.Uuid
+  sessionDate            DateTime  @db.Date
+  mode                   QueueMode
+  retentionScore         Float     @default(0)
+  backlogMinutesEstimate Int       @default(0)
+  overdueDaysMax         Int       @default(0)
+  minutesTotal           Int       @default(0)
+  reviewsTotal           Int       @default(0)
+  reviewsSuccessful      Int       @default(0)
+  newAyahsMemorized      Int       @default(0)
+  warmupPassed           Boolean   @default(false)
+  sabaqAllowed           Boolean   @default(false)
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, sessionDate])
+  @@index([userId, sessionDate])
+}
+
+model TransitionScore {
+  userId         String   @db.Uuid
+  fromAyahId     Int
+  toAyahId       Int
+  successCount   Int      @default(0)
+  attemptCount   Int      @default(0)
+  lastPracticedAt DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  user     User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fromAyah Ayah @relation("TransitionFromAyah", fields: [fromAyahId], references: [id], onDelete: Restrict)
+  toAyah   Ayah @relation("TransitionToAyah", fields: [toAyahId], references: [id], onDelete: Restrict)
+
+  @@id([userId, fromAyahId, toAyahId])
+  @@index([userId])
+  @@index([userId, successCount])
+}
+
+model FluencyGateTest {
+  id              String            @id @default(uuid()) @db.Uuid
+  userId          String            @db.Uuid
+  testPage        Int
+  status          FluencyGateStatus
+  durationSeconds Int?
+  errorCount      Int?
+  fluencyScore    Int?
+  startedAt       DateTime          @default(now())
+  completedAt     DateTime?
+
+  user            User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
