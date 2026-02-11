@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: hifzer-backend
+    runtime: node
+    plan: starter
+    region: oregon
+    autoDeploy: true
+    buildCommand: pnpm install --frozen-lockfile && pnpm prisma generate && pnpm build
+    startCommand: pnpm prisma migrate deploy && pnpm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: NODE_ENV
+        value: production
+      # BullMQ optional - keep inline processing by default on hobby tier.
+      - key: PROCESS_EVENTS_INLINE
+        value: "true"
+      - key: PORT
+        value: "4000"
+      # Required secrets/config (set in Render dashboard or Blueprint prompts).
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_ACCESS_SECRET
+        sync: false
+      - key: JWT_ACCESS_TTL
+        value: 15m
+      - key: JWT_REFRESH_TTL_DAYS
+        value: "30"
+      - key: REFRESH_TOKEN_PEPPER
+        sync: false
+      - key: AYAHS_SEED_PATH
+        value: ./prisma/seeds/ayahs.template.json

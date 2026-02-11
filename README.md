@@ -6,14 +6,14 @@ Node.js + TypeScript + Express backend for Hifz OS MVP.
 
 - API: Express + Zod
 - DB: Postgres + Prisma
-- Queue/worker: Redis + BullMQ
+- Queue/worker: Redis + BullMQ (optional)
 - Tests: Vitest
 
 ## Prerequisites
 
 - Node.js 20+
 - pnpm 10+
-- Docker (for local Postgres/Redis)
+- Docker (for local Postgres; Redis only if BullMQ enabled)
 
 ## Run locally
 
@@ -23,7 +23,7 @@ Node.js + TypeScript + Express backend for Hifz OS MVP.
 cp .env.example .env
 ```
 
-2. Start Postgres + Redis:
+2. Start Postgres:
 
 ```bash
 docker compose up -d
@@ -54,11 +54,37 @@ pnpm seed
 pnpm dev
 ```
 
-7. Run reducer worker (separate terminal):
+7. Optional: run reducer worker (only when `PROCESS_EVENTS_INLINE=false`, separate terminal):
 
 ```bash
 pnpm worker
 ```
+
+## Background Jobs (Optional)
+
+BullMQ queue processing is kept in the codebase, but disabled by default for lower-cost/hobby environments.
+
+- Default: `PROCESS_EVENTS_INLINE=true` (no Redis required, event reducer runs inline).
+- Scale mode: set `PROCESS_EVENTS_INLINE=false`, provide `REDIS_URL`, run `pnpm worker`.
+- Local Redis in `docker-compose.yml` is commented out by default; uncomment it when enabling BullMQ.
+
+## Deploy to Render
+
+This repo includes `render.yaml` configured for inline event processing by default:
+
+- `PROCESS_EVENTS_INLINE=true` (no Redis service required).
+- Health check path: `/health`.
+- Build/start runs Prisma generate + migrate + app start.
+
+Quick steps:
+
+1. Create a new Web Service in Render from this repo.
+2. Use the included `render.yaml` Blueprint.
+3. Set required secrets:
+   - `DATABASE_URL`
+   - `JWT_ACCESS_SECRET`
+   - `REFRESH_TOKEN_PEPPER`
+4. Deploy and verify `GET /health`.
 
 ## Seed data notes
 
