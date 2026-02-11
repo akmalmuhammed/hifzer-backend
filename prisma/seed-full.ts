@@ -20,6 +20,7 @@ const ayahSchema = z.object({
 
 const ayahArraySchema = z.array(ayahSchema);
 const EXPECTED_AYAHS_COUNT = 6236;
+const CHUNK_SIZE = 500;
 
 async function main(): Promise<void> {
   const seedPath = path.resolve(__dirname, "seeds", "ayahs.full.json");
@@ -48,16 +49,16 @@ async function main(): Promise<void> {
     seenKeys.add(ayahKey);
   }
 
-  for (const ayah of ayahs) {
-    await prisma.ayah.upsert({
-      where: { id: ayah.id },
-      create: ayah,
-      update: ayah
+  for (let i = 0; i < ayahs.length; i += CHUNK_SIZE) {
+    const chunk = ayahs.slice(i, i + CHUNK_SIZE);
+    await prisma.ayah.createMany({
+      data: chunk,
+      skipDuplicates: true
     });
   }
 
   // eslint-disable-next-line no-console
-  console.log(`Seeded ${ayahs.length} ayahs from ${seedPath}`);
+  console.log(`Seed ensured for ${ayahs.length} ayahs from ${seedPath}`);
 }
 
 main()
