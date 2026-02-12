@@ -1,5 +1,11 @@
 import { Hono, type Context } from "hono";
-import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
+import {
+  createRemoteJWKSet,
+  decodeJwt,
+  decodeProtectedHeader,
+  jwtVerify,
+  type JWTPayload
+} from "jose";
 import { createHash } from "node:crypto";
 import postgres, { type Sql } from "postgres";
 import { ZodError, z } from "zod";
@@ -240,7 +246,8 @@ function parseCsv(raw?: string): string[] {
   return raw
     .split(",")
     .map((value) => value.trim())
-    .filter(Boolean);
+    .filter((value) => value.length > 0)
+    .filter((value) => value.toLowerCase() !== "undefined" && value.toLowerCase() !== "null");
 }
 
 function getConnectionString(env: WorkerBindings): string {
@@ -294,14 +301,39 @@ function getRemoteJwks(env: WorkerBindings) {
 async function verifyClerkToken(
   env: WorkerBindings,
   token: string
-): Promise<{ sub: string; email: string | null }> {
+): Promise<{
+  sub: string;
+  email: string | null;
+  tokenIssuer: string | null;
+  verificationMode: "strict-issuer" | "jwks-only";
+}> {
   const audience = parseCsv(env.CLERK_JWT_AUDIENCE);
   const issuer = env.CLERK_JWT_ISSUER?.trim();
 
-  const { payload } = await jwtVerify(token, getRemoteJwks(env), {
-    issuer: issuer && issuer.length > 0 ? issuer : undefined,
+  const verifyOptions = {
     audience: audience.length > 0 ? audience : undefined
-  });
+  };
+
+  let payload: JWTPayload;
+  let verificationMode: "strict-issuer" | "jwks-only" = "strict-issuer";
+
+  try {
+    const result = await jwtVerify(token, getRemoteJwks(env), {
+      ...verifyOptions,
+      issuer: issuer && issuer.length > 0 ? [issuer, `${issuer}/`] : undefined
+    });
+    payload = result.payload;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const isIssuerMismatch = message.toLowerCase().includes("unexpected \"iss\"");
+    if (!isIssuerMismatch || !issuer) {
+      throw error;
+    }
+
+    const result = await jwtVerify(token, getRemoteJwks(env), verifyOptions);
+    payload = result.payload;
+    verificationMode = "jwks-only";
+  }
 
   const claims = payload as ClerkClaims;
   if (!claims.sub || claims.sub.trim().length === 0) {
@@ -318,8 +350,41 @@ async function verifyClerkToken(
 
   return {
     sub: claims.sub,
-    email: normalizedEmail
+    email: normalizedEmail,
+    tokenIssuer: typeof claims.iss === "string" ? claims.iss : null,
+    verificationMode
   };
+}
+
+function decodeTokenDiagnostics(token: string): {
+  iss: string | null;
+  aud: string | string[] | null;
+  azp: string | null;
+  kid: string | null;
+  alg: string | null;
+} {
+  try {
+    const claims = decodeJwt(token) as JWTPayload & { azp?: string };
+    const header = decodeProtectedHeader(token);
+    return {
+      iss: typeof claims.iss === "string" ? claims.iss : null,
+      aud:
+        typeof claims.aud === "string" || Array.isArray(claims.aud)
+          ? claims.aud
+          : null,
+      azp: typeof claims.azp === "string" ? claims.azp : null,
+      kid: typeof header.kid === "string" ? header.kid : null,
+      alg: typeof header.alg === "string" ? header.alg : null
+    };
+  } catch {
+    return {
+      iss: null,
+      aud: null,
+      azp: null,
+      kid: null,
+      alg: null
+    };
+  }
 }
 
 function fallbackEmailForClerkSub(clerkSub: string): string {
@@ -2412,11 +2477,27 @@ async function requireClerkUser(c: Context<AppEnv>): Promise<{ id: string; email
 
   try {
     const identity = await verifyClerkToken(c.env, token);
+    if (identity.verificationMode === "jwks-only") {
+      console.warn("clerk_issuer_fallback", {
+        requestId: c.get("requestId"),
+        configuredIssuer: c.env.CLERK_JWT_ISSUER ?? null,
+        tokenIssuer: identity.tokenIssuer
+      });
+    }
     return await ensureLocalUser(c.env, identity);
   } catch (error) {
+    const tokenDiagnostics = decodeTokenDiagnostics(token);
     console.error("clerk_verify_failed", {
       ...authDiagnostics,
-      error: error instanceof Error ? error.message : String(error)
+      error: error instanceof Error ? error.message : String(error),
+      configuredIssuer: c.env.CLERK_JWT_ISSUER ?? null,
+      configuredAudience: parseCsv(c.env.CLERK_JWT_AUDIENCE),
+      configuredJwksUrl: c.env.CLERK_JWKS_URL ?? null,
+      tokenIssuer: tokenDiagnostics.iss,
+      tokenAudience: tokenDiagnostics.aud,
+      tokenAzp: tokenDiagnostics.azp,
+      tokenKid: tokenDiagnostics.kid,
+      tokenAlg: tokenDiagnostics.alg
     });
     throw new Response(
       JSON.stringify({
