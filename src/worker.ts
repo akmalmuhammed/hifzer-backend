@@ -1071,6 +1071,88 @@ async function getTodayQueue(env: WorkerBindings, userId: string, now = new Date
   };
 }
 
+async function getUserStats(env: WorkerBindings, userId: string) {
+  const sql = getSql(env);
+  const now = new Date();
+
+  const [totalItemsRows, dueItemsRows, latestDailyRows, upcomingDueRows, completedSessionsRows] =
+    await Promise.all([
+      sql<{ count: string }[]>`
+        SELECT COUNT(*)::text AS "count"
+        FROM "UserItemState"
+        WHERE "userId" = ${userId}
+      `,
+      sql<{ count: string }[]>`
+        SELECT COUNT(*)::text AS "count"
+        FROM "UserItemState"
+        WHERE "userId" = ${userId}
+          AND "nextReviewAt" <= ${now}
+      `,
+      sql<{
+        sessionDate: Date | string;
+        retentionScore: number;
+        backlogMinutesEstimate: number;
+        minutesTotal: number;
+        mode: QueueMode;
+      }[]>`
+        SELECT
+          "sessionDate",
+          "retentionScore",
+          "backlogMinutesEstimate",
+          "minutesTotal",
+          "mode"::text AS "mode"
+        FROM "DailySession"
+        WHERE "userId" = ${userId}
+        ORDER BY "sessionDate" DESC
+        LIMIT 1
+      `,
+      sql<{
+        ayahId: number;
+        nextReviewAt: Date | string;
+        tier: ReviewTier;
+      }[]>`
+        SELECT "ayahId", "nextReviewAt", "tier"::text AS "tier"
+        FROM "UserItemState"
+        WHERE "userId" = ${userId}
+        ORDER BY "nextReviewAt" ASC
+        LIMIT 12
+      `,
+      sql<{ count: string }[]>`
+        SELECT COUNT(*)::text AS "count"
+        FROM "SessionRun"
+        WHERE "userId" = ${userId}
+          AND "status" = ${"COMPLETED"}::"SessionStatus"
+      `
+    ]);
+
+  const latestDaily = latestDailyRows[0];
+  return {
+    total_items_tracked: Number(totalItemsRows[0]?.count ?? "0"),
+    due_items: Number(dueItemsRows[0]?.count ?? "0"),
+    completed_sessions: Number(completedSessionsRows[0]?.count ?? "0"),
+    latest_daily_session: latestDaily
+      ? {
+          sessionDate:
+            latestDaily.sessionDate instanceof Date
+              ? latestDaily.sessionDate.toISOString()
+              : new Date(latestDaily.sessionDate).toISOString(),
+          retentionScore: latestDaily.retentionScore,
+          backlogMinutesEstimate: latestDaily.backlogMinutesEstimate,
+          minutesTotal: latestDaily.minutesTotal,
+          mode: latestDaily.mode
+        }
+      : null,
+    upcoming_due: upcomingDueRows.map((item) => ({
+      ayah_id: item.ayahId,
+      next_review_at:
+        item.nextReviewAt instanceof Date
+          ? item.nextReviewAt.toISOString()
+          : new Date(item.nextReviewAt).toISOString(),
+      tier: item.tier
+    }))
+  };
+}
+
 function isPgUniqueViolation(error: unknown): boolean {
   return (
     typeof error === "object" &&
@@ -2382,6 +2464,36 @@ app.post("/api/v1/session/complete", async (c) => {
     return c.json(
       {
         error: "Failed to complete session",
+        requestId: c.get("requestId")
+      },
+      500
+    );
+  }
+});
+
+app.get("/api/v1/user/stats", async (c) => {
+  let user: { id: string; email: string };
+  try {
+    user = await requireClerkUser(c);
+  } catch (error) {
+    if (error instanceof Response) {
+      return error;
+    }
+    throw error;
+  }
+
+  try {
+    const stats = await getUserStats(c.env, user.id);
+    return c.json(stats);
+  } catch (error) {
+    console.error("user_stats_failed", {
+      requestId: c.get("requestId"),
+      userId: user.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return c.json(
+      {
+        error: "Failed to load user stats",
         requestId: c.get("requestId")
       },
       500
