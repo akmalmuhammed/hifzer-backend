@@ -2369,11 +2369,28 @@ async function ingestReviewEvent(
 }
 
 async function requireClerkUser(c: Context<AppEnv>): Promise<{ id: string; email: string }> {
-  const authorization = c.req.header("authorization") ?? "";
+  const authorizationHeader = c.req.header("authorization");
+  const authorization = authorizationHeader ?? "";
+  const authDiagnostics = {
+    requestId: c.get("requestId"),
+    method: c.req.method,
+    path: c.req.path,
+    origin: c.req.header("origin") ?? null,
+    referer: c.req.header("referer") ?? null,
+    userAgent: c.req.header("user-agent") ?? null,
+    hasAuthorizationHeader: Boolean(authorizationHeader),
+    authorizationPrefix: authorizationHeader ? authorizationHeader.split(" ")[0] : null,
+    hasBearerPrefix: authorization.startsWith("Bearer "),
+    hasCookieHeader: Boolean(c.req.header("cookie")),
+    cfRay: c.req.header("cf-ray") ?? null
+  };
+
   if (!authorization.startsWith("Bearer ")) {
+    console.warn("auth_missing_bearer", authDiagnostics);
     throw new Response(
       JSON.stringify({
         error: "Missing bearer token",
+        code: "MISSING_BEARER_TOKEN",
         requestId: c.get("requestId")
       }),
       { status: 401, headers: { "content-type": "application/json" } }
@@ -2382,9 +2399,11 @@ async function requireClerkUser(c: Context<AppEnv>): Promise<{ id: string; email
 
   const token = authorization.slice("Bearer ".length).trim();
   if (!token) {
+    console.warn("auth_empty_bearer_token", authDiagnostics);
     throw new Response(
       JSON.stringify({
         error: "Missing bearer token",
+        code: "EMPTY_BEARER_TOKEN",
         requestId: c.get("requestId")
       }),
       { status: 401, headers: { "content-type": "application/json" } }
@@ -2396,12 +2415,13 @@ async function requireClerkUser(c: Context<AppEnv>): Promise<{ id: string; email
     return await ensureLocalUser(c.env, identity);
   } catch (error) {
     console.error("clerk_verify_failed", {
-      requestId: c.get("requestId"),
+      ...authDiagnostics,
       error: error instanceof Error ? error.message : String(error)
     });
     throw new Response(
       JSON.stringify({
         error: "Invalid access token",
+        code: "INVALID_ACCESS_TOKEN",
         requestId: c.get("requestId")
       }),
       { status: 401, headers: { "content-type": "application/json" } }
