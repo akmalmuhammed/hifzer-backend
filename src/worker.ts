@@ -34,6 +34,9 @@ type GoalType = "SURAH" | "JUZ" | "FULL_QURAN";
 type PriorJuzBand = "ZERO" | "ONE_TO_FIVE" | "FIVE_PLUS";
 type ProgramVariant = "MOMENTUM" | "STANDARD" | "CONSERVATIVE";
 type ScaffoldingLevel = "BEGINNER" | "STANDARD" | "MINIMAL";
+type QueueMode = "NORMAL" | "REVIEW_ONLY" | "CONSOLIDATION";
+type ReviewTier = "SABAQ" | "SABQI" | "MANZIL";
+type FluencyGateStatus = "IN_PROGRESS" | "PASSED" | "FAILED";
 
 type AssessmentPayload = {
   time_budget_minutes: 15 | 30 | 60 | 90;
@@ -72,6 +75,54 @@ const assessmentSchema = z.object({
   has_teacher: z.boolean(),
   prior_juz_band: z.enum(["ZERO", "ONE_TO_FIVE", "FIVE_PLUS"])
 });
+
+const fluencyGateSubmitSchema = z.object({
+  test_id: z.string().uuid(),
+  duration_seconds: z.number().int().positive(),
+  error_count: z.number().int().min(0)
+});
+
+type RiskState = {
+  ayahId: number;
+  tier: ReviewTier;
+  nextReviewAt: Date;
+  lapses: number;
+  difficultyScore: number;
+  lastErrorsCount: number;
+  ayah: {
+    surahNumber: number;
+    ayahNumber: number;
+    pageNumber: number;
+  };
+};
+
+type DebtMetrics = {
+  dueItemsCount: number;
+  backlogMinutesEstimate: number;
+  overdueDaysMax: number;
+  freezeThresholdMinutes: number;
+};
+
+type WarmupEvaluation = {
+  totalItems: number;
+  passed: boolean;
+  failed: boolean;
+  pending: boolean;
+  passingAyahIds: number[];
+  failingAyahIds: number[];
+};
+
+type UserRow = {
+  id: string;
+  timeBudgetMinutes: number;
+  avgSecondsPerItem: number;
+  backlogFreezeRatio: number;
+  retentionThreshold: number;
+  dailyNewTargetAyahs: number;
+  manzilRotationDays: number;
+  fluencyGatePassed: boolean;
+  requiresPreHifz: boolean;
+};
 
 const sqlClientCache = new Map<string, Sql>();
 const clerkJwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
@@ -312,6 +363,618 @@ async function persistAssessment(
   `;
 }
 
+function startOfUtcDay(date: Date): Date {
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+}
+
+function endOfUtcDay(date: Date): Date {
+  const start = startOfUtcDay(date);
+  return new Date(start.getTime() + 24 * 60 * 60 * 1000 - 1);
+}
+
+function addDays(date: Date, days: number): Date {
+  return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
+}
+
+function diffInDaysFloor(later: Date, earlier: Date): number {
+  return Math.floor((later.getTime() - earlier.getTime()) / (24 * 60 * 60 * 1000));
+}
+
+function calculateFluencyScore(durationSeconds: number, errorCount: number) {
+  const timeScore = durationSeconds < 180 ? 50 : Math.max(0, 50 - (durationSeconds - 180) / 6);
+  const accuracyScore = errorCount < 5 ? 50 : Math.max(0, 50 - (errorCount - 5) * 5);
+  const fluencyScore = Math.round(timeScore + accuracyScore);
+  return {
+    fluency_score: fluencyScore,
+    time_score: Math.round(timeScore),
+    accuracy_score: Math.round(accuracyScore),
+    passed: fluencyScore >= 70
+  };
+}
+
+function randomFrom<T>(items: T[]): T {
+  return items[Math.floor(Math.random() * items.length)];
+}
+
+async function startFluencyGateTest(env: WorkerBindings, userId: string) {
+  const sql = getSql(env);
+  const [memorizedPagesRaw, availablePagesRaw] = await Promise.all([
+    sql<{ pageNumber: number }[]>`
+      SELECT DISTINCT a."pageNumber" AS "pageNumber"
+      FROM "UserItemState" uis
+      JOIN "Ayah" a ON a."id" = uis."ayahId"
+      WHERE uis."userId" = ${userId}
+        AND uis."firstMemorizedAt" IS NOT NULL
+    `,
+    sql<{ pageNumber: number }[]>`
+      SELECT DISTINCT "pageNumber" AS "pageNumber"
+      FROM "Ayah"
+      ORDER BY "pageNumber" ASC
+    `
+  ]);
+
+  const availablePages = availablePagesRaw.map((row) => row.pageNumber);
+  if (availablePages.length === 0) {
+    throw new Error("Ayah metadata is not seeded. Load ayahs before starting fluency gate.");
+  }
+
+  const memorizedPages = new Set(memorizedPagesRaw.map((row) => row.pageNumber));
+  const candidatePages = availablePages.filter((page) => !memorizedPages.has(page));
+  const selectedPage = randomFrom(candidatePages.length > 0 ? candidatePages : availablePages);
+
+  const pageAyahs = await sql<{
+    id: number;
+    surahNumber: number;
+    ayahNumber: number;
+    textUthmani: string | null;
+  }[]>`
+    SELECT "id", "surahNumber", "ayahNumber", "textUthmani"
+    FROM "Ayah"
+    WHERE "pageNumber" = ${selectedPage}
+    ORDER BY "ayahNumber" ASC
+  `;
+
+  const testId = crypto.randomUUID();
+  await sql`
+    INSERT INTO "FluencyGateTest" ("id", "userId", "testPage", "status")
+    VALUES (${testId}, ${userId}, ${selectedPage}, ${"IN_PROGRESS"}::"FluencyGateStatus")
+  `;
+
+  return {
+    test_id: testId,
+    page: selectedPage,
+    ayahs: pageAyahs.map((ayah) => ({
+      id: ayah.id,
+      surah_number: ayah.surahNumber,
+      ayah_number: ayah.ayahNumber,
+      text_uthmani: ayah.textUthmani
+    })),
+    instructions: "Read this page aloud in under 3 minutes with fewer than 5 tajweed errors"
+  };
+}
+
+async function submitFluencyGateTest(params: {
+  env: WorkerBindings;
+  userId: string;
+  testId: string;
+  durationSeconds: number;
+  errorCount: number;
+}) {
+  const sql = getSql(params.env);
+  const testRows = await sql<{ id: string }[]>`
+    SELECT "id"
+    FROM "FluencyGateTest"
+    WHERE "id" = ${params.testId}
+      AND "userId" = ${params.userId}
+      AND "status" = ${"IN_PROGRESS"}::"FluencyGateStatus"
+    LIMIT 1
+  `;
+  if (testRows.length === 0) {
+    return null;
+  }
+
+  const score = calculateFluencyScore(params.durationSeconds, params.errorCount);
+  const completedAt = new Date();
+
+  await Promise.all([
+    sql`
+      UPDATE "FluencyGateTest"
+      SET
+        "durationSeconds" = ${params.durationSeconds},
+        "errorCount" = ${params.errorCount},
+        "fluencyScore" = ${score.fluency_score},
+        "status" = ${score.passed ? "PASSED" : "FAILED"}::"FluencyGateStatus",
+        "completedAt" = ${completedAt}
+      WHERE "id" = ${params.testId}
+    `,
+    sql`
+      UPDATE "User"
+      SET
+        "fluencyScore" = ${score.fluency_score},
+        "fluencyGatePassed" = ${score.passed},
+        "requiresPreHifz" = ${!score.passed},
+        "updatedAt" = ${completedAt}
+      WHERE "id" = ${params.userId}
+    `
+  ]);
+
+  return {
+    passed: score.passed,
+    fluency_score: score.fluency_score,
+    time_score: score.time_score,
+    accuracy_score: score.accuracy_score,
+    message: score.passed
+      ? "Fluency Gate passed. You can begin memorizing."
+      : "Your reading needs strengthening. Please complete Pre-Hifz fluency training first."
+  };
+}
+
+async function getFluencyGateStatus(env: WorkerBindings, userId: string) {
+  const sql = getSql(env);
+  const [userRows, latestRows] = await Promise.all([
+    sql<{
+      fluencyScore: number | null;
+      fluencyGatePassed: boolean;
+      requiresPreHifz: boolean;
+    }[]>`
+      SELECT "fluencyScore", "fluencyGatePassed", "requiresPreHifz"
+      FROM "User"
+      WHERE "id" = ${userId}
+      LIMIT 1
+    `,
+    sql<{
+      id: string;
+      testPage: number;
+      status: FluencyGateStatus;
+      fluencyScore: number | null;
+      completedAt: Date | null;
+    }[]>`
+      SELECT "id", "testPage", "status", "fluencyScore", "completedAt"
+      FROM "FluencyGateTest"
+      WHERE "userId" = ${userId}
+      ORDER BY "startedAt" DESC
+      LIMIT 1
+    `
+  ]);
+
+  const user = userRows[0];
+  if (!user) {
+    throw new Error("User not found");
+  }
+
+  const latest = latestRows[0];
+  return {
+    fluency_score: user.fluencyScore,
+    fluency_gate_passed: user.fluencyGatePassed,
+    requires_pre_hifz: user.requiresPreHifz,
+    latest_test: latest
+      ? {
+          id: latest.id,
+          test_page: latest.testPage,
+          status: latest.status,
+          fluency_score: latest.fluencyScore,
+          completed_at: latest.completedAt ? latest.completedAt.toISOString() : null
+        }
+      : null
+  };
+}
+
+function calculateDebtMetrics(params: {
+  dueItemsCount: number;
+  avgSecondsPerItem: number;
+  timeBudgetMinutes: number;
+  backlogFreezeRatio: number;
+  now: Date;
+  earliestDueAt?: Date;
+}): DebtMetrics {
+  const backlogMinutesEstimate = Math.ceil((params.dueItemsCount * params.avgSecondsPerItem) / 60);
+  const overdueDaysMax =
+    params.earliestDueAt && params.earliestDueAt <= params.now
+      ? diffInDaysFloor(params.now, params.earliestDueAt)
+      : 0;
+  const freezeThresholdMinutes = Math.floor(params.timeBudgetMinutes * params.backlogFreezeRatio);
+  return {
+    dueItemsCount: params.dueItemsCount,
+    backlogMinutesEstimate,
+    overdueDaysMax,
+    freezeThresholdMinutes
+  };
+}
+
+function evaluateWarmup(
+  ayahIds: number[],
+  attempts: Array<{ ayahId: number; success: boolean; errorsCount: number }>
+): WarmupEvaluation {
+  if (ayahIds.length === 0) {
+    return {
+      totalItems: 0,
+      passed: true,
+      failed: false,
+      pending: false,
+      passingAyahIds: [],
+      failingAyahIds: []
+    };
+  }
+
+  const attemptsByAyah = new Map<number, Array<{ success: boolean; errorsCount: number }>>();
+  for (const attempt of attempts) {
+    if (!attemptsByAyah.has(attempt.ayahId)) {
+      attemptsByAyah.set(attempt.ayahId, []);
+    }
+    attemptsByAyah.get(attempt.ayahId)?.push(attempt);
+  }
+
+  const passingAyahIds: number[] = [];
+  const failingAyahIds: number[] = [];
+  let pendingCount = 0;
+
+  for (const ayahId of ayahIds) {
+    const itemAttempts = attemptsByAyah.get(ayahId) ?? [];
+    if (itemAttempts.length === 0) {
+      pendingCount += 1;
+      continue;
+    }
+    const hasPass = itemAttempts.some((item) => item.success && item.errorsCount <= 1);
+    if (hasPass) {
+      passingAyahIds.push(ayahId);
+    } else {
+      failingAyahIds.push(ayahId);
+    }
+  }
+
+  return {
+    totalItems: ayahIds.length,
+    passed: passingAyahIds.length === ayahIds.length,
+    failed: failingAyahIds.length > 0,
+    pending: pendingCount > 0,
+    passingAyahIds,
+    failingAyahIds
+  };
+}
+
+function determineQueueMode(params: {
+  debt: DebtMetrics;
+  retentionRolling7d: number;
+  retentionThreshold: number;
+  warmup: WarmupEvaluation;
+}): QueueMode {
+  const debtFreeze =
+    params.debt.backlogMinutesEstimate > params.debt.freezeThresholdMinutes ||
+    params.debt.overdueDaysMax > 2;
+  if (debtFreeze || params.warmup.failed) {
+    return "REVIEW_ONLY";
+  }
+  if (params.retentionRolling7d < params.retentionThreshold) {
+    return "CONSOLIDATION";
+  }
+  return "NORMAL";
+}
+
+function sortByRisk(now: Date, a: RiskState, b: RiskState): number {
+  const overdueA = Math.max(0, Math.floor((now.getTime() - a.nextReviewAt.getTime()) / 1000));
+  const overdueB = Math.max(0, Math.floor((now.getTime() - b.nextReviewAt.getTime()) / 1000));
+  if (overdueA !== overdueB) {
+    return overdueB - overdueA;
+  }
+  if (a.lapses !== b.lapses) {
+    return b.lapses - a.lapses;
+  }
+  if (a.difficultyScore !== b.difficultyScore) {
+    return b.difficultyScore - a.difficultyScore;
+  }
+  return b.lastErrorsCount - a.lastErrorsCount;
+}
+
+function buildManzilQueue(params: {
+  dueManzilStates: RiskState[];
+  activeManzilStates: RiskState[];
+  manzilRotationDays: number;
+  now: Date;
+}): RiskState[] {
+  const dueSorted = [...params.dueManzilStates].sort((a, b) => sortByRisk(params.now, a, b));
+  const targetCount = Math.max(
+    1,
+    Math.ceil(params.activeManzilStates.length / Math.max(1, params.manzilRotationDays))
+  );
+  if (dueSorted.length >= targetCount) {
+    return dueSorted;
+  }
+
+  const included = new Set(dueSorted.map((state) => state.ayahId));
+  const fillers = params.activeManzilStates
+    .filter((state) => !included.has(state.ayahId))
+    .sort((a, b) => sortByRisk(params.now, a, b));
+
+  return [...dueSorted, ...fillers.slice(0, targetCount - dueSorted.length)];
+}
+
+function toQueueItem(now: Date, state: RiskState) {
+  return {
+    ayah_id: state.ayahId,
+    surah_number: state.ayah.surahNumber,
+    ayah_number: state.ayah.ayahNumber,
+    page_number: state.ayah.pageNumber,
+    tier: state.tier,
+    next_review_at: state.nextReviewAt.toISOString(),
+    overdue_seconds: Math.max(0, Math.floor((now.getTime() - state.nextReviewAt.getTime()) / 1000)),
+    lapses: state.lapses,
+    difficulty_score: state.difficultyScore
+  };
+}
+
+async function computeRetentionRolling7d(sql: Sql, userId: string, now: Date): Promise<number> {
+  const start = startOfUtcDay(addDays(now, -6));
+  const end = endOfUtcDay(now);
+  const sessions = await sql<{ retentionScore: number }[]>`
+    SELECT "retentionScore"
+    FROM "DailySession"
+    WHERE "userId" = ${userId}
+      AND "sessionDate" >= ${start}
+      AND "sessionDate" <= ${end}
+  `;
+
+  if (sessions.length === 0) {
+    return 1;
+  }
+  const sum = sessions.reduce((acc, row) => acc + row.retentionScore, 0);
+  return sum / sessions.length;
+}
+
+function normalizeRiskStateRow(row: {
+  ayahId: number;
+  tier: string;
+  nextReviewAt: Date | string;
+  lapses: number;
+  difficultyScore: number;
+  lastErrorsCount: number;
+  surahNumber: number;
+  ayahNumber: number;
+  pageNumber: number;
+}): RiskState {
+  return {
+    ayahId: row.ayahId,
+    tier: row.tier as ReviewTier,
+    nextReviewAt: row.nextReviewAt instanceof Date ? row.nextReviewAt : new Date(row.nextReviewAt),
+    lapses: row.lapses,
+    difficultyScore: row.difficultyScore,
+    lastErrorsCount: row.lastErrorsCount,
+    ayah: {
+      surahNumber: row.surahNumber,
+      ayahNumber: row.ayahNumber,
+      pageNumber: row.pageNumber
+    }
+  };
+}
+
+async function getTodayQueue(env: WorkerBindings, userId: string, now = new Date()) {
+  const sql = getSql(env);
+  const userRows = await sql<UserRow[]>`
+    SELECT
+      "id",
+      "timeBudgetMinutes",
+      "avgSecondsPerItem",
+      "backlogFreezeRatio",
+      "retentionThreshold",
+      "dailyNewTargetAyahs",
+      "manzilRotationDays",
+      "fluencyGatePassed",
+      "requiresPreHifz"
+    FROM "User"
+    WHERE "id" = ${userId}
+    LIMIT 1
+  `;
+  const user = userRows[0];
+  if (!user) {
+    throw new Error("User not found");
+  }
+
+  if (user.requiresPreHifz || !user.fluencyGatePassed) {
+    return {
+      mode: "FLUENCY_GATE_REQUIRED" as const,
+      message: "You must pass the Fluency Gate test before memorizing",
+      sabaq_allowed: false,
+      sabqi_queue: [],
+      manzil_queue: [],
+      weak_transitions: [],
+      link_repair_recommended: false,
+      action_required: "COMPLETE_FLUENCY_GATE" as const
+    };
+  }
+
+  const dueStatesRaw = await sql<{
+    ayahId: number;
+    tier: string;
+    nextReviewAt: Date | string;
+    lapses: number;
+    difficultyScore: number;
+    lastErrorsCount: number;
+    surahNumber: number;
+    ayahNumber: number;
+    pageNumber: number;
+  }[]>`
+    SELECT
+      uis."ayahId",
+      uis."tier"::text AS "tier",
+      uis."nextReviewAt",
+      uis."lapses",
+      uis."difficultyScore",
+      uis."lastErrorsCount",
+      a."surahNumber",
+      a."ayahNumber",
+      a."pageNumber"
+    FROM "UserItemState" uis
+    JOIN "Ayah" a ON a."id" = uis."ayahId"
+    WHERE uis."userId" = ${userId}
+      AND uis."nextReviewAt" <= ${now}
+  `;
+  const dueStates = dueStatesRaw.map((row) => normalizeRiskStateRow(row));
+  const earliestDueAt = dueStates.length
+    ? dueStates.reduce((earliest, current) =>
+        current.nextReviewAt < earliest ? current.nextReviewAt : earliest,
+      dueStates[0].nextReviewAt)
+    : undefined;
+
+  const debt = calculateDebtMetrics({
+    dueItemsCount: dueStates.length,
+    avgSecondsPerItem: user.avgSecondsPerItem,
+    timeBudgetMinutes: user.timeBudgetMinutes,
+    backlogFreezeRatio: user.backlogFreezeRatio,
+    now,
+    earliestDueAt
+  });
+
+  const yesterdayStart = startOfUtcDay(addDays(now, -1));
+  const yesterdayEnd = endOfUtcDay(addDays(now, -1));
+  const warmupAyahRows = await sql<{ ayahId: number }[]>`
+    SELECT "ayahId"
+    FROM "UserItemState"
+    WHERE "userId" = ${userId}
+      AND "introducedAt" >= ${yesterdayStart}
+      AND "introducedAt" <= ${yesterdayEnd}
+  `;
+  const warmupAyahIds = warmupAyahRows.map((row) => row.ayahId);
+
+  let warmupAttempts: Array<{ ayahId: number; success: boolean; errorsCount: number }> = [];
+  if (warmupAyahIds.length > 0) {
+    const todayStart = startOfUtcDay(now);
+    const attemptsRaw = await sql<{
+      itemAyahId: number | null;
+      success: boolean | null;
+      errorsCount: number | null;
+    }[]>`
+      SELECT "itemAyahId", "success", "errorsCount"
+      FROM "ReviewEvent"
+      WHERE "userId" = ${userId}
+        AND "eventType" = ${"REVIEW_ATTEMPTED"}::"ReviewEventType"
+        AND "occurredAt" >= ${todayStart}
+    `;
+    const warmupSet = new Set(warmupAyahIds);
+    warmupAttempts = attemptsRaw
+      .filter((row) => row.itemAyahId !== null && row.success !== null && warmupSet.has(row.itemAyahId))
+      .map((row) => ({
+        ayahId: row.itemAyahId as number,
+        success: row.success as boolean,
+        errorsCount: row.errorsCount ?? 0
+      }));
+  }
+
+  const warmup = evaluateWarmup(warmupAyahIds, warmupAttempts);
+  const retentionRolling7d = await computeRetentionRolling7d(sql, userId, now);
+  let mode = determineQueueMode({
+    debt,
+    retentionRolling7d,
+    retentionThreshold: user.retentionThreshold,
+    warmup
+  });
+
+  const sabqiQueueRaw = dueStates
+    .filter((state) => state.tier !== "MANZIL")
+    .sort((a, b) => sortByRisk(now, a, b));
+  const dueManzil = dueStates.filter((state) => state.tier === "MANZIL");
+
+  const activeManzilRaw = await sql<{
+    ayahId: number;
+    tier: string;
+    nextReviewAt: Date | string;
+    lapses: number;
+    difficultyScore: number;
+    lastErrorsCount: number;
+    surahNumber: number;
+    ayahNumber: number;
+    pageNumber: number;
+  }[]>`
+    SELECT
+      uis."ayahId",
+      uis."tier"::text AS "tier",
+      uis."nextReviewAt",
+      uis."lapses",
+      uis."difficultyScore",
+      uis."lastErrorsCount",
+      a."surahNumber",
+      a."ayahNumber",
+      a."pageNumber"
+    FROM "UserItemState" uis
+    JOIN "Ayah" a ON a."id" = uis."ayahId"
+    WHERE uis."userId" = ${userId}
+      AND uis."tier" = ${"MANZIL"}::"ReviewTier"
+  `;
+  const activeManzil = activeManzilRaw.map((row) => normalizeRiskStateRow(row));
+  const manzilQueueRaw = buildManzilQueue({
+    dueManzilStates: dueManzil,
+    activeManzilStates: activeManzil,
+    manzilRotationDays: user.manzilRotationDays,
+    now
+  });
+
+  const weakTransitionsRaw = await sql<{
+    fromAyahId: number;
+    toAyahId: number;
+    successCount: number;
+    attemptCount: number;
+    successRate: number;
+  }[]>`
+    SELECT
+      "fromAyahId",
+      "toAyahId",
+      "successCount",
+      "attemptCount",
+      ("successCount"::float / NULLIF("attemptCount", 0)) AS "successRate"
+    FROM "TransitionScore"
+    WHERE "userId" = ${userId}
+      AND "attemptCount" >= 3
+      AND ("successCount"::float / NULLIF("attemptCount", 0)) < 0.70
+    ORDER BY "successRate" ASC
+    LIMIT 10
+  `;
+
+  const warmupBlockedReason = warmup.failed ? "warmup_failed" : warmup.pending ? "warmup_pending" : "none";
+  if (mode !== "REVIEW_ONLY" && warmup.failed) {
+    mode = "REVIEW_ONLY";
+  }
+
+  let targetAyahs = user.dailyNewTargetAyahs;
+  if (mode === "CONSOLIDATION") {
+    targetAyahs = Math.max(1, Math.floor(user.dailyNewTargetAyahs / 2));
+  }
+  if (mode === "REVIEW_ONLY") {
+    targetAyahs = 0;
+  }
+
+  return {
+    mode,
+    debt,
+    retentionRolling7d,
+    warmup_test: {
+      max_errors: 1,
+      total_items: warmup.totalItems,
+      passed: warmup.passed,
+      failed: warmup.failed,
+      pending: warmup.pending,
+      ayah_ids: warmupAyahIds
+    },
+    sabaq_task: {
+      allowed: mode !== "REVIEW_ONLY" && warmup.passed,
+      target_ayahs: targetAyahs,
+      blocked_reason:
+        mode === "REVIEW_ONLY"
+          ? warmup.failed
+            ? "warmup_failed"
+            : "mode_review_only"
+          : warmupBlockedReason
+    },
+    sabqi_queue: sabqiQueueRaw.map((state) => toQueueItem(now, state)),
+    manzil_queue: manzilQueueRaw.map((state) => toQueueItem(now, state)),
+    weak_transitions: weakTransitionsRaw.map((item) => ({
+      from_ayah_id: item.fromAyahId,
+      to_ayah_id: item.toAyahId,
+      success_rate: item.successRate,
+      success_count: item.successCount,
+      attempt_count: item.attemptCount
+    })),
+    link_repair_recommended: weakTransitionsRaw.length > 5
+  };
+}
+
 async function requireClerkUser(c: Context<AppEnv>): Promise<{ id: string; email: string }> {
   const authorization = c.req.header("authorization") ?? "";
   if (!authorization.startsWith("Bearer ")) {
@@ -488,6 +1151,153 @@ app.post("/api/v1/assessment/submit", async (c) => {
     return c.json(
       {
         error: "Failed to submit assessment",
+        requestId: c.get("requestId")
+      },
+      500
+    );
+  }
+});
+
+app.post("/api/v1/fluency-gate/start", async (c) => {
+  let user: { id: string; email: string };
+  try {
+    user = await requireClerkUser(c);
+  } catch (error) {
+    if (error instanceof Response) {
+      return error;
+    }
+    throw error;
+  }
+
+  try {
+    const result = await startFluencyGateTest(c.env, user.id);
+    return c.json(result);
+  } catch (error) {
+    console.error("fluency_gate_start_failed", {
+      requestId: c.get("requestId"),
+      userId: user.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return c.json(
+      {
+        error: error instanceof Error ? error.message : "Failed to start fluency gate test",
+        requestId: c.get("requestId")
+      },
+      500
+    );
+  }
+});
+
+app.post("/api/v1/fluency-gate/submit", async (c) => {
+  let user: { id: string; email: string };
+  try {
+    user = await requireClerkUser(c);
+  } catch (error) {
+    if (error instanceof Response) {
+      return error;
+    }
+    throw error;
+  }
+
+  try {
+    const raw = await c.req.json();
+    const payload = fluencyGateSubmitSchema.parse(raw);
+    const result = await submitFluencyGateTest({
+      env: c.env,
+      userId: user.id,
+      testId: payload.test_id,
+      durationSeconds: payload.duration_seconds,
+      errorCount: payload.error_count
+    });
+    if (!result) {
+      return c.json(
+        {
+          error: "Test not found or already completed",
+          requestId: c.get("requestId")
+        },
+        404
+      );
+    }
+    return c.json(result);
+  } catch (error) {
+    if (error instanceof ZodError) {
+      return c.json(
+        {
+          error: "Invalid request payload",
+          details: error.flatten(),
+          requestId: c.get("requestId")
+        },
+        400
+      );
+    }
+    console.error("fluency_gate_submit_failed", {
+      requestId: c.get("requestId"),
+      userId: user.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return c.json(
+      {
+        error: "Failed to submit fluency gate test",
+        requestId: c.get("requestId")
+      },
+      500
+    );
+  }
+});
+
+app.get("/api/v1/fluency-gate/status", async (c) => {
+  let user: { id: string; email: string };
+  try {
+    user = await requireClerkUser(c);
+  } catch (error) {
+    if (error instanceof Response) {
+      return error;
+    }
+    throw error;
+  }
+
+  try {
+    const result = await getFluencyGateStatus(c.env, user.id);
+    return c.json(result);
+  } catch (error) {
+    console.error("fluency_gate_status_failed", {
+      requestId: c.get("requestId"),
+      userId: user.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return c.json(
+      {
+        error: "Failed to load fluency gate status",
+        requestId: c.get("requestId")
+      },
+      500
+    );
+  }
+});
+
+app.get("/api/v1/queue/today", async (c) => {
+  let user: { id: string; email: string };
+  try {
+    user = await requireClerkUser(c);
+  } catch (error) {
+    if (error instanceof Response) {
+      return error;
+    }
+    throw error;
+  }
+
+  try {
+    const result = await getTodayQueue(c.env, user.id);
+    return c.json(result);
+  } catch (error) {
+    console.error("queue_today_failed", {
+      requestId: c.get("requestId"),
+      userId: user.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return c.json(
+      {
+        error: "Failed to generate today queue",
         requestId: c.get("requestId")
       },
       500
