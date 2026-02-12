@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "hifzer-backend",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-02-12",
+  "observability": {
+    "enabled": true
+  },
+  "compatibility_flags": ["nodejs_compat"],
+  "hyperdrive": [
+    {
+      "binding": "HYPERDRIVE",
+      "id": "d023c736a3a647738ef009225be04f8e"
+    }
+  ],
+  "vars": {
+    "NODE_ENV": "production",
+    "PROCESS_EVENTS_INLINE": "true",
+    "CORS_ORIGINS": "https://hifzer-frontend.vercel.app"
+  }
+}
