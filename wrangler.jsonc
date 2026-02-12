@@ -16,6 +16,8 @@
   "vars": {
     "NODE_ENV": "production",
     "PROCESS_EVENTS_INLINE": "true",
-    "CORS_ORIGINS": "https://hifzer-frontend.vercel.app"
+    "CORS_ORIGINS": "https://hifzer-frontend.vercel.app",
+    "CLERK_JWT_ISSUER": "https://eager-bat-78.clerk.accounts.dev",
+    "CLERK_JWKS_URL": "https://eager-bat-78.clerk.accounts.dev/.well-known/jwks.json"
   }
 }
