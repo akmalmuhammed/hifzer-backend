@@ -37,5 +37,9 @@ services:
         value: production
       - key: SENTRY_TRACES_SAMPLE_RATE
         value: "0.1"
+      - key: OBSERVABILITY_DEBUG_ENABLED
+        value: "false"
+      - key: OBSERVABILITY_DEBUG_TOKEN
+        sync: false
       - key: AYAHS_SEED_PATH
         value: ./prisma/seeds/ayahs.template.json

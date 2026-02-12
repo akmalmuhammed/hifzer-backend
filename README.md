@@ -106,6 +106,8 @@ This backend now includes:
 - `SENTRY_DSN=`
 - `SENTRY_ENVIRONMENT=production`
 - `SENTRY_TRACES_SAMPLE_RATE=0.1`
+- `OBSERVABILITY_DEBUG_ENABLED=false`
+- `OBSERVABILITY_DEBUG_TOKEN=` (required only when debug endpoint enabled)
 - `PRISMA_QUERY_LOGS=false`
 
 ### Health endpoints
@@ -122,6 +124,25 @@ Create monitors for:
 2. `https://hifzer-backend.onrender.com/health/ready`
 
 Alert target: email + Slack/Discord webhook. Trigger on 2 consecutive failures.
+
+### Backend Sentry smoke test (optional)
+
+1. Set temporary env vars in Render:
+   - `OBSERVABILITY_DEBUG_ENABLED=true`
+   - `OBSERVABILITY_DEBUG_TOKEN=<long-random-string>`
+2. Redeploy backend.
+3. Trigger test error:
+
+```bash
+curl -X POST https://hifzer-backend.onrender.com/health/debug/sentry \
+  -H "x-observability-token: <long-random-string>"
+```
+
+Expected result: HTTP 500 and a new issue in backend Sentry project ("Sentry backend test").
+
+4. Disable test endpoint after verification:
+   - `OBSERVABILITY_DEBUG_ENABLED=false`
+   - Redeploy backend.
 
 ## Clerk Auth Migration (Optional)
 
