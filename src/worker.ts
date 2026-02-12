@@ -1,5 +1,6 @@
 import { Hono, type Context } from "hono";
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
+import { createHash } from "node:crypto";
 import postgres, { type Sql } from "postgres";
 import { ZodError, z } from "zod";
 
@@ -37,6 +38,10 @@ type ScaffoldingLevel = "BEGINNER" | "STANDARD" | "MINIMAL";
 type QueueMode = "NORMAL" | "REVIEW_ONLY" | "CONSOLIDATION";
 type ReviewTier = "SABAQ" | "SABQI" | "MANZIL";
 type FluencyGateStatus = "IN_PROGRESS" | "PASSED" | "FAILED";
+type ReviewEventType = "REVIEW_ATTEMPTED" | "TRANSITION_ATTEMPTED";
+type ReviewSessionType = "SABAQ" | "SABQI" | "MANZIL" | "WARMUP";
+type ReviewStepType = "EXPOSURE" | "GUIDED" | "BLIND" | "LINK";
+type SessionStatus = "ACTIVE" | "COMPLETED" | "ABANDONED";
 
 type AssessmentPayload = {
   time_budget_minutes: 15 | 30 | 60 | 90;
@@ -82,6 +87,80 @@ const fluencyGateSubmitSchema = z.object({
   error_count: z.number().int().min(0)
 });
 
+const sessionStartSchema = z.object({
+  client_session_id: z.string().uuid().optional(),
+  mode: z.enum(["NORMAL", "REVIEW_ONLY", "CONSOLIDATION"]).optional(),
+  warmup_passed: z.boolean().optional()
+});
+
+const sessionCompleteSchema = z.object({
+  session_id: z.string().uuid()
+});
+
+const stepCompleteSchema = z
+  .object({
+    session_id: z.string().uuid(),
+    ayah_id: z.number().int().positive(),
+    step_type: z.enum(["EXPOSURE", "GUIDED", "BLIND", "LINK"]),
+    attempt_number: z.number().int().min(1).max(3),
+    success: z.boolean(),
+    errors_count: z.number().int().min(0).default(0),
+    scaffolding_used: z.boolean().optional(),
+    duration_seconds: z.number().int().positive().optional(),
+    linked_ayah_id: z.number().int().positive().optional()
+  })
+  .superRefine((value, ctx) => {
+    if (value.step_type === "LINK" && !value.linked_ayah_id) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "linked_ayah_id is required for link step"
+      });
+    }
+  });
+
+const reviewAttemptEventSchema = z
+  .object({
+    client_event_id: z.string().uuid(),
+    session_id: z.string().uuid().optional(),
+    event_type: z.literal("REVIEW_ATTEMPTED"),
+    session_type: z.enum(["SABAQ", "SABQI", "MANZIL", "WARMUP"]).optional(),
+    occurred_at: z.coerce.date(),
+    item_ayah_id: z.number().int().positive(),
+    tier: z.enum(["SABAQ", "SABQI", "MANZIL"]),
+    step_type: z.enum(["EXPOSURE", "GUIDED", "BLIND", "LINK"]).optional(),
+    attempt_number: z.number().int().min(1).max(3).optional(),
+    scaffolding_used: z.boolean().optional(),
+    linked_ayah_id: z.number().int().positive().optional(),
+    success: z.boolean(),
+    errors_count: z.number().int().min(0).default(0),
+    duration_seconds: z.number().int().positive(),
+    error_tags: z.array(z.string()).optional()
+  })
+  .superRefine((value, ctx) => {
+    if (value.step_type === "LINK" && !value.linked_ayah_id) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "linked_ayah_id is required for link step"
+      });
+    }
+  });
+
+const transitionAttemptEventSchema = z.object({
+  client_event_id: z.string().uuid(),
+  session_id: z.string().uuid().optional(),
+  event_type: z.literal("TRANSITION_ATTEMPTED"),
+  session_type: z.enum(["SABAQ", "SABQI", "MANZIL", "WARMUP"]).optional(),
+  occurred_at: z.coerce.date(),
+  from_ayah_id: z.number().int().positive(),
+  to_ayah_id: z.number().int().positive(),
+  success: z.boolean()
+});
+
+const reviewEventSchema = z.discriminatedUnion("event_type", [
+  reviewAttemptEventSchema,
+  transitionAttemptEventSchema
+]);
+
 type RiskState = {
   ayahId: number;
   tier: ReviewTier;
@@ -122,6 +201,23 @@ type UserRow = {
   manzilRotationDays: number;
   fluencyGatePassed: boolean;
   requiresPreHifz: boolean;
+};
+
+type ProtocolStep = {
+  step: ReviewStepType;
+  attempts: number;
+  optional?: boolean;
+};
+
+type StepProtocol = {
+  scaffoldingLevel: ScaffoldingLevel;
+  steps: ProtocolStep[];
+};
+
+type StepExpectation = {
+  expectedStep: ReviewStepType | null;
+  expectedAttempt: number | null;
+  completed: boolean;
 };
 
 const sqlClientCache = new Map<string, Sql>();
@@ -975,6 +1071,514 @@ async function getTodayQueue(env: WorkerBindings, userId: string, now = new Date
   };
 }
 
+function isPgUniqueViolation(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === "23505"
+  );
+}
+
+function deterministicEventUuid(input: string): string {
+  const hash = createHash("sha256").update(input).digest("hex");
+  const chars = hash.slice(0, 32).split("");
+  chars[12] = "4";
+  const variantNibble = parseInt(chars[16], 16);
+  chars[16] = ((variantNibble & 0x3) | 0x8).toString(16);
+  return `${chars.slice(0, 8).join("")}-${chars.slice(8, 12).join("")}-${chars.slice(12, 16).join("")}-${chars.slice(16, 20).join("")}-${chars.slice(20, 32).join("")}`;
+}
+
+function buildProtocol(scaffoldingLevel: ScaffoldingLevel): StepProtocol {
+  if (scaffoldingLevel === "BEGINNER") {
+    return {
+      scaffoldingLevel,
+      steps: [
+        { step: "EXPOSURE", attempts: 3 },
+        { step: "GUIDED", attempts: 3 },
+        { step: "BLIND", attempts: 3 },
+        { step: "LINK", attempts: 3 }
+      ]
+    };
+  }
+
+  if (scaffoldingLevel === "MINIMAL") {
+    return {
+      scaffoldingLevel,
+      steps: [
+        { step: "EXPOSURE", attempts: 3, optional: true },
+        { step: "GUIDED", attempts: 3, optional: true },
+        { step: "BLIND", attempts: 3 },
+        { step: "LINK", attempts: 3 }
+      ]
+    };
+  }
+
+  return {
+    scaffoldingLevel,
+    steps: [
+      { step: "EXPOSURE", attempts: 3 },
+      { step: "GUIDED", attempts: 1 },
+      { step: "BLIND", attempts: 3 },
+      { step: "LINK", attempts: 3 }
+    ]
+  };
+}
+
+function protocolSummary(protocol: StepProtocol) {
+  return protocol.steps.map((step) => ({
+    step: step.step,
+    attempts_required: step.attempts,
+    optional: Boolean(step.optional)
+  }));
+}
+
+function countAttemptsByStep(
+  stepAttempts: Array<{ stepType: ReviewStepType | null }>
+): Map<ReviewStepType, number> {
+  const counts = new Map<ReviewStepType, number>();
+  for (const item of stepAttempts) {
+    if (!item.stepType) {
+      continue;
+    }
+    counts.set(item.stepType, (counts.get(item.stepType) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function expectedFromProtocol(
+  protocol: StepProtocol,
+  counts: Map<ReviewStepType, number>
+): StepExpectation {
+  for (const step of protocol.steps) {
+    if (step.optional) {
+      continue;
+    }
+    const observed = counts.get(step.step) ?? 0;
+    if (observed < step.attempts) {
+      return {
+        expectedStep: step.step,
+        expectedAttempt: observed + 1,
+        completed: false
+      };
+    }
+  }
+  return {
+    expectedStep: null,
+    expectedAttempt: null,
+    completed: true
+  };
+}
+
+function validateStepAttempt(params: {
+  protocol: StepProtocol;
+  expected: StepExpectation;
+  counts: Map<ReviewStepType, number>;
+  stepType: ReviewStepType;
+  attemptNumber: number;
+}): boolean {
+  if (params.expected.completed) {
+    return false;
+  }
+
+  const optionalStep = params.protocol.steps.find(
+    (step) => step.optional && step.step === params.stepType
+  );
+  if (optionalStep) {
+    if (params.expected.expectedStep !== "BLIND") {
+      return false;
+    }
+    const observed = params.counts.get(params.stepType) ?? 0;
+    const expectedOptionalAttempt = observed + 1;
+    return (
+      params.attemptNumber === expectedOptionalAttempt &&
+      params.attemptNumber <= optionalStep.attempts
+    );
+  }
+
+  return (
+    params.stepType === params.expected.expectedStep &&
+    params.attemptNumber === params.expected.expectedAttempt
+  );
+}
+
+function outcomeFromAttempt(success: boolean, errorsCount: number): "perfect" | "minor" | "fail" {
+  if (!success) {
+    return "fail";
+  }
+  if (errorsCount === 0) {
+    return "perfect";
+  }
+  if (errorsCount <= 2) {
+    return "minor";
+  }
+  return "fail";
+}
+
+const SRS_CHECKPOINTS_SECONDS = [
+  4 * 60 * 60,
+  8 * 60 * 60,
+  1 * 24 * 60 * 60,
+  3 * 24 * 60 * 60,
+  7 * 24 * 60 * 60,
+  14 * 24 * 60 * 60,
+  30 * 24 * 60 * 60,
+  90 * 24 * 60 * 60
+] as const;
+
+function checkpointIndexForInterval(currentIntervalSeconds: number): number {
+  const found = SRS_CHECKPOINTS_SECONDS.findIndex((checkpoint) => checkpoint >= currentIntervalSeconds);
+  if (found >= 0) {
+    return found;
+  }
+  return SRS_CHECKPOINTS_SECONDS.length - 1;
+}
+
+function tierFromCheckpoint(index: number): ReviewTier {
+  if (index <= 1) {
+    return "SABAQ";
+  }
+  if (index <= 5) {
+    return "SABQI";
+  }
+  return "MANZIL";
+}
+
+function adjustDifficulty(current: number, outcome: "perfect" | "minor" | "fail"): number {
+  if (outcome === "fail") {
+    return Math.min(1, current + 0.1);
+  }
+  if (outcome === "minor") {
+    return Math.min(1, current + 0.03);
+  }
+  return Math.max(0, current - 0.05);
+}
+
+function applyPromotionGate(params: {
+  previousConsecutivePerfectDays: number;
+  previousPerfectDay: string | null;
+  eventOccurredAt: Date;
+  success: boolean;
+  errorsCount: number;
+  checkpointIndex: number;
+}): {
+  consecutivePerfectDays: number;
+  perfectDay: string | null;
+  tier: ReviewTier;
+} {
+  let consecutivePerfectDays = params.previousConsecutivePerfectDays;
+  let perfectDay = params.previousPerfectDay;
+  const isPerfect = params.success && params.errorsCount === 0;
+
+  if (isPerfect) {
+    const eventDay = params.eventOccurredAt.toISOString().slice(0, 10);
+    if (!perfectDay) {
+      consecutivePerfectDays = 1;
+    } else {
+      const previous = new Date(`${perfectDay}T00:00:00.000Z`).getTime();
+      const current = new Date(`${eventDay}T00:00:00.000Z`).getTime();
+      const diffDays = Math.floor((current - previous) / (24 * 60 * 60 * 1000));
+      if (diffDays === 1) {
+        consecutivePerfectDays += 1;
+      } else if (diffDays > 1) {
+        consecutivePerfectDays = 1;
+      }
+    }
+    perfectDay = eventDay;
+  } else {
+    consecutivePerfectDays = 0;
+    perfectDay = null;
+  }
+
+  let tier = tierFromCheckpoint(params.checkpointIndex);
+  if (tier === "MANZIL" && consecutivePerfectDays < 7) {
+    tier = "SABQI";
+  }
+
+  return {
+    consecutivePerfectDays,
+    perfectDay,
+    tier
+  };
+}
+
+async function updateTransitionScore(params: {
+  sql: Sql;
+  userId: string;
+  fromAyahId: number;
+  toAyahId: number;
+  success: boolean;
+  occurredAt: Date;
+}) {
+  const now = new Date();
+  await params.sql`
+    INSERT INTO "TransitionScore"
+      ("userId", "fromAyahId", "toAyahId", "successCount", "attemptCount", "lastPracticedAt", "createdAt", "updatedAt")
+    VALUES
+      (
+        ${params.userId},
+        ${params.fromAyahId},
+        ${params.toAyahId},
+        ${params.success ? 1 : 0},
+        1,
+        ${params.occurredAt},
+        ${now},
+        ${now}
+      )
+    ON CONFLICT ("userId", "fromAyahId", "toAyahId")
+    DO UPDATE SET
+      "successCount" = "TransitionScore"."successCount" + ${params.success ? 1 : 0},
+      "attemptCount" = "TransitionScore"."attemptCount" + 1,
+      "lastPracticedAt" = EXCLUDED."lastPracticedAt",
+      "updatedAt" = EXCLUDED."updatedAt"
+  `;
+}
+
+async function rebuildItemState(sql: Sql, userId: string, ayahId: number): Promise<void> {
+  const events = await sql<{
+    occurredAt: Date | string;
+    success: boolean | null;
+    errorsCount: number | null;
+    durationSeconds: number | null;
+  }[]>`
+    SELECT "occurredAt", "success", "errorsCount", "durationSeconds"
+    FROM "ReviewEvent"
+    WHERE "userId" = ${userId}
+      AND "eventType" = ${"REVIEW_ATTEMPTED"}::"ReviewEventType"
+      AND "itemAyahId" = ${ayahId}
+    ORDER BY "occurredAt" ASC, "id" ASC
+  `;
+
+  if (events.length === 0) {
+    return;
+  }
+
+  let checkpointIndex = 0;
+  let intervalSeconds = 4 * 60 * 60;
+  let nextReviewAt = new Date(events[0].occurredAt);
+  let tier: ReviewTier = "SABAQ";
+  const introducedAt = new Date(events[0].occurredAt);
+  let firstMemorizedAt: Date | null = null;
+  let difficultyScore = 0;
+  let totalReviews = 0;
+  let successfulReviews = 0;
+  let lapses = 0;
+  let successStreak = 0;
+  let averageDurationSeconds = 0;
+  let lastErrorsCount = 0;
+  let consecutivePerfectDays = 0;
+  let lastPerfectDay: string | null = null;
+  let lastReviewedAt: Date | null = null;
+  let lastEventOccurredAt: Date | null = null;
+
+  for (const event of events) {
+    const occurredAt = new Date(event.occurredAt);
+    const success = Boolean(event.success);
+    const errorsCount = event.errorsCount ?? 0;
+    const currentIndex = checkpointIndexForInterval(intervalSeconds);
+    const outcome = outcomeFromAttempt(success, errorsCount);
+    checkpointIndex =
+      outcome === "perfect"
+        ? Math.min(currentIndex + 1, SRS_CHECKPOINTS_SECONDS.length - 1)
+        : outcome === "minor"
+          ? currentIndex
+          : 0;
+    intervalSeconds = SRS_CHECKPOINTS_SECONDS[checkpointIndex];
+    nextReviewAt = new Date(occurredAt.getTime() + intervalSeconds * 1000);
+
+    totalReviews += 1;
+    successfulReviews += success ? 1 : 0;
+    lapses += success ? 0 : 1;
+    successStreak = success ? successStreak + 1 : 0;
+    difficultyScore = adjustDifficulty(difficultyScore, outcome);
+    lastErrorsCount = errorsCount;
+    lastReviewedAt = occurredAt;
+    lastEventOccurredAt = occurredAt;
+    if (event.durationSeconds && event.durationSeconds > 0) {
+      averageDurationSeconds = Math.round(
+        ((averageDurationSeconds * (totalReviews - 1)) + event.durationSeconds) / totalReviews
+      );
+    }
+
+    const promotion = applyPromotionGate({
+      previousConsecutivePerfectDays: consecutivePerfectDays,
+      previousPerfectDay: lastPerfectDay,
+      eventOccurredAt: occurredAt,
+      success,
+      errorsCount,
+      checkpointIndex
+    });
+    consecutivePerfectDays = promotion.consecutivePerfectDays;
+    lastPerfectDay = promotion.perfectDay;
+    tier = promotion.tier;
+
+    if (!firstMemorizedAt && checkpointIndex >= 2) {
+      firstMemorizedAt = occurredAt;
+    }
+  }
+
+  const now = new Date();
+  await sql`
+    INSERT INTO "UserItemState"
+      (
+        "id", "userId", "ayahId", "status", "tier", "nextReviewAt", "reviewIntervalSeconds",
+        "intervalCheckpointIndex", "introducedAt", "firstMemorizedAt", "difficultyScore",
+        "totalReviews", "successfulReviews", "lapses", "successStreak", "consecutivePerfectDays",
+        "averageDurationSeconds", "lastErrorsCount", "lastReviewedAt", "lastEventOccurredAt", "updatedAt"
+      )
+    VALUES
+      (
+        ${crypto.randomUUID()},
+        ${userId},
+        ${ayahId},
+        ${checkpointIndex >= 2 ? "MEMORIZED" : "LEARNING"}::"ItemStatus",
+        ${tier}::"ReviewTier",
+        ${nextReviewAt},
+        ${intervalSeconds},
+        ${checkpointIndex},
+        ${introducedAt},
+        ${firstMemorizedAt},
+        ${difficultyScore},
+        ${totalReviews},
+        ${successfulReviews},
+        ${lapses},
+        ${successStreak},
+        ${consecutivePerfectDays},
+        ${averageDurationSeconds},
+        ${lastErrorsCount},
+        ${lastReviewedAt},
+        ${lastEventOccurredAt},
+        ${now}
+      )
+    ON CONFLICT ("userId", "ayahId")
+    DO UPDATE SET
+      "status" = EXCLUDED."status",
+      "tier" = EXCLUDED."tier",
+      "nextReviewAt" = EXCLUDED."nextReviewAt",
+      "reviewIntervalSeconds" = EXCLUDED."reviewIntervalSeconds",
+      "intervalCheckpointIndex" = EXCLUDED."intervalCheckpointIndex",
+      "introducedAt" = EXCLUDED."introducedAt",
+      "firstMemorizedAt" = EXCLUDED."firstMemorizedAt",
+      "difficultyScore" = EXCLUDED."difficultyScore",
+      "totalReviews" = EXCLUDED."totalReviews",
+      "successfulReviews" = EXCLUDED."successfulReviews",
+      "lapses" = EXCLUDED."lapses",
+      "successStreak" = EXCLUDED."successStreak",
+      "consecutivePerfectDays" = EXCLUDED."consecutivePerfectDays",
+      "averageDurationSeconds" = EXCLUDED."averageDurationSeconds",
+      "lastErrorsCount" = EXCLUDED."lastErrorsCount",
+      "lastReviewedAt" = EXCLUDED."lastReviewedAt",
+      "lastEventOccurredAt" = EXCLUDED."lastEventOccurredAt",
+      "updatedAt" = EXCLUDED."updatedAt"
+  `;
+}
+
+async function ingestReviewEvent(
+  env: WorkerBindings,
+  userId: string,
+  payload: z.infer<typeof reviewEventSchema>
+): Promise<{ deduplicated: boolean; event_id?: string }> {
+  const sql = getSql(env);
+  let createdId: string | undefined;
+
+  try {
+    if (payload.event_type === "REVIEW_ATTEMPTED") {
+      const rows = await sql<{ id: string }[]>`
+        INSERT INTO "ReviewEvent"
+          (
+            "userId", "sessionRunId", "clientEventId", "eventType", "sessionType",
+            "itemAyahId", "tier", "stepType", "attemptNumber", "scaffoldingUsed", "linkedAyahId",
+            "success", "errorsCount", "durationSeconds", "errorTags", "occurredAt"
+          )
+        VALUES
+          (
+            ${userId},
+            ${payload.session_id ?? null},
+            ${payload.client_event_id},
+            ${payload.event_type}::"ReviewEventType",
+            ${(payload.session_type ?? payload.tier)}::"ReviewSessionType",
+            ${payload.item_ayah_id},
+            ${payload.tier}::"ReviewTier",
+            ${payload.step_type ?? null}::"ReviewStepType",
+            ${payload.attempt_number ?? null},
+            ${Boolean(payload.scaffolding_used)},
+            ${payload.linked_ayah_id ?? null},
+            ${payload.success},
+            ${payload.errors_count},
+            ${payload.duration_seconds},
+            ${payload.error_tags ? JSON.stringify(payload.error_tags) : null}::jsonb,
+            ${payload.occurred_at}
+          )
+        RETURNING "id"::text
+      `;
+      createdId = rows[0]?.id;
+    } else {
+      const rows = await sql<{ id: string }[]>`
+        INSERT INTO "ReviewEvent"
+          (
+            "userId", "sessionRunId", "clientEventId", "eventType", "sessionType",
+            "fromAyahId", "toAyahId", "success", "occurredAt"
+          )
+        VALUES
+          (
+            ${userId},
+            ${payload.session_id ?? null},
+            ${payload.client_event_id},
+            ${payload.event_type}::"ReviewEventType",
+            ${(payload.session_type ?? "SABQI")}::"ReviewSessionType",
+            ${payload.from_ayah_id},
+            ${payload.to_ayah_id},
+            ${payload.success},
+            ${payload.occurred_at}
+          )
+        RETURNING "id"::text
+      `;
+      createdId = rows[0]?.id;
+    }
+  } catch (error) {
+    if (isPgUniqueViolation(error)) {
+      return { deduplicated: true };
+    }
+    throw error;
+  }
+
+  if (payload.session_id) {
+    await sql`
+      UPDATE "SessionRun"
+      SET "eventsCount" = "eventsCount" + 1, "updatedAt" = ${new Date()}
+      WHERE "id" = ${payload.session_id} AND "userId" = ${userId}
+    `;
+  }
+
+  if (payload.event_type === "REVIEW_ATTEMPTED") {
+    await rebuildItemState(sql, userId, payload.item_ayah_id);
+    if (payload.step_type === "LINK" && payload.linked_ayah_id) {
+      await updateTransitionScore({
+        sql,
+        userId,
+        fromAyahId: payload.item_ayah_id,
+        toAyahId: payload.linked_ayah_id,
+        success: payload.success,
+        occurredAt: payload.occurred_at
+      });
+    }
+  } else {
+    await updateTransitionScore({
+      sql,
+      userId,
+      fromAyahId: payload.from_ayah_id,
+      toAyahId: payload.to_ayah_id,
+      success: payload.success,
+      occurredAt: payload.occurred_at
+    });
+  }
+
+  return {
+    deduplicated: false,
+    event_id: createdId
+  };
+}
+
 async function requireClerkUser(c: Context<AppEnv>): Promise<{ id: string; email: string }> {
   const authorization = c.req.header("authorization") ?? "";
   if (!authorization.startsWith("Bearer ")) {
@@ -1298,6 +1902,486 @@ app.get("/api/v1/queue/today", async (c) => {
     return c.json(
       {
         error: "Failed to generate today queue",
+        requestId: c.get("requestId")
+      },
+      500
+    );
+  }
+});
+
+app.post("/api/v1/session/start", async (c) => {
+  let user: { id: string; email: string };
+  try {
+    user = await requireClerkUser(c);
+  } catch (error) {
+    if (error instanceof Response) {
+      return error;
+    }
+    throw error;
+  }
+
+  try {
+    const payload = sessionStartSchema.parse(await c.req.json());
+    const queue = await getTodayQueue(c.env, user.id);
+    if (queue.mode === "FLUENCY_GATE_REQUIRED") {
+      return c.json(
+        {
+          error: queue.message,
+          requestId: c.get("requestId")
+        },
+        403
+      );
+    }
+
+    const mode = payload.mode ?? queue.mode;
+    const warmupPassed = payload.warmup_passed ?? queue.warmup_test.passed;
+    const now = new Date();
+    const sessionId = crypto.randomUUID();
+    const sql = getSql(c.env);
+
+    let rows: Array<{ id: string; mode: QueueMode; warmupPassed: boolean | null }> = [];
+    if (payload.client_session_id) {
+      rows = await sql<{ id: string; mode: QueueMode; warmupPassed: boolean | null }[]>`
+        INSERT INTO "SessionRun"
+          ("id", "userId", "clientSessionId", "mode", "warmupPassed", "status", "updatedAt")
+        VALUES
+          (
+            ${sessionId},
+            ${user.id},
+            ${payload.client_session_id},
+            ${mode}::"QueueMode",
+            ${warmupPassed},
+            ${"ACTIVE"}::"SessionStatus",
+            ${now}
+          )
+        ON CONFLICT ("userId", "clientSessionId")
+        DO UPDATE SET "updatedAt" = EXCLUDED."updatedAt"
+        RETURNING "id", "mode"::text AS "mode", "warmupPassed"
+      `;
+    } else {
+      rows = await sql<{ id: string; mode: QueueMode; warmupPassed: boolean | null }[]>`
+        INSERT INTO "SessionRun"
+          ("id", "userId", "mode", "warmupPassed", "status", "updatedAt")
+        VALUES
+          (
+            ${sessionId},
+            ${user.id},
+            ${mode}::"QueueMode",
+            ${warmupPassed},
+            ${"ACTIVE"}::"SessionStatus",
+            ${now}
+          )
+        RETURNING "id", "mode"::text AS "mode", "warmupPassed"
+      `;
+    }
+
+    const created = rows[0];
+    return c.json(
+      {
+        session_id: created.id,
+        mode: created.mode,
+        warmup_passed: created.warmupPassed
+      },
+      201
+    );
+  } catch (error) {
+    if (error instanceof ZodError) {
+      return c.json(
+        {
+          error: "Invalid request payload",
+          details: error.flatten(),
+          requestId: c.get("requestId")
+        },
+        400
+      );
+    }
+    console.error("session_start_failed", {
+      requestId: c.get("requestId"),
+      userId: user.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return c.json(
+      {
+        error: "Failed to start session",
+        requestId: c.get("requestId")
+      },
+      500
+    );
+  }
+});
+
+app.post("/api/v1/session/step-complete", async (c) => {
+  let user: { id: string; email: string };
+  try {
+    user = await requireClerkUser(c);
+  } catch (error) {
+    if (error instanceof Response) {
+      return error;
+    }
+    throw error;
+  }
+
+  try {
+    const payload = stepCompleteSchema.parse(await c.req.json());
+    const sql = getSql(c.env);
+
+    const [sessionRows, userRows, existingStepRows] = await Promise.all([
+      sql<{ id: string; status: SessionStatus }[]>`
+        SELECT "id", "status"::text AS "status"
+        FROM "SessionRun"
+        WHERE "id" = ${payload.session_id}
+          AND "userId" = ${user.id}
+        LIMIT 1
+      `,
+      sql<{ scaffoldingLevel: ScaffoldingLevel }[]>`
+        SELECT "scaffoldingLevel"::text AS "scaffoldingLevel"
+        FROM "User"
+        WHERE "id" = ${user.id}
+        LIMIT 1
+      `,
+      sql<{ stepType: ReviewStepType | null }[]>`
+        SELECT "stepType"::text AS "stepType"
+        FROM "ReviewEvent"
+        WHERE "userId" = ${user.id}
+          AND "sessionRunId" = ${payload.session_id}
+          AND "eventType" = ${"REVIEW_ATTEMPTED"}::"ReviewEventType"
+          AND "itemAyahId" = ${payload.ayah_id}
+        ORDER BY "occurredAt" ASC, "id" ASC
+      `
+    ]);
+
+    const session = sessionRows[0];
+    if (!session) {
+      return c.json(
+        {
+          error: "Session not found",
+          requestId: c.get("requestId")
+        },
+        404
+      );
+    }
+    if (session.status !== "ACTIVE") {
+      return c.json(
+        {
+          error: "Session already completed",
+          requestId: c.get("requestId")
+        },
+        409
+      );
+    }
+
+    const userRow = userRows[0];
+    if (!userRow) {
+      return c.json(
+        {
+          error: "User not found",
+          requestId: c.get("requestId")
+        },
+        404
+      );
+    }
+
+    const protocol = buildProtocol(userRow.scaffoldingLevel);
+    const existingCounts = countAttemptsByStep(existingStepRows);
+    const expectedBefore = expectedFromProtocol(protocol, existingCounts);
+
+    const isValid = validateStepAttempt({
+      protocol,
+      expected: expectedBefore,
+      counts: existingCounts,
+      stepType: payload.step_type,
+      attemptNumber: payload.attempt_number
+    });
+    if (!isValid) {
+      return c.json(
+        {
+          error: "Invalid step sequence",
+          code: "INVALID_STEP_SEQUENCE",
+          expected_step: expectedBefore.expectedStep,
+          expected_attempt: expectedBefore.expectedAttempt,
+          required_protocol: protocolSummary(protocol),
+          requestId: c.get("requestId")
+        },
+        409
+      );
+    }
+
+    const clientEventId = deterministicEventUuid(
+      `${payload.session_id}:${payload.ayah_id}:${payload.step_type}:${payload.attempt_number}`
+    );
+    const ingestResult = await ingestReviewEvent(c.env, user.id, {
+      client_event_id: clientEventId,
+      session_id: payload.session_id,
+      event_type: "REVIEW_ATTEMPTED",
+      session_type: "SABAQ",
+      occurred_at: new Date(),
+      item_ayah_id: payload.ayah_id,
+      tier: "SABAQ",
+      step_type: payload.step_type,
+      attempt_number: payload.attempt_number,
+      scaffolding_used: payload.scaffolding_used ?? false,
+      linked_ayah_id: payload.linked_ayah_id,
+      success: payload.success,
+      errors_count: payload.errors_count,
+      duration_seconds: payload.duration_seconds ?? 1
+    });
+
+    const nextCounts = new Map(existingCounts);
+    nextCounts.set(payload.step_type, (nextCounts.get(payload.step_type) ?? 0) + 1);
+    const expectedAfter = expectedFromProtocol(protocol, nextCounts);
+    const attemptGoalForStep =
+      protocol.steps.find((step) => step.step === payload.step_type)?.attempts ?? 3;
+
+    let stepStatus: "IN_PROGRESS" | "STEP_COMPLETE" | "AYAH_COMPLETE" = "IN_PROGRESS";
+    let nextStep: ReviewStepType | "COMPLETE" | null = null;
+    let nextAttempt: number | null = null;
+
+    if (expectedAfter.completed) {
+      stepStatus = "AYAH_COMPLETE";
+      nextStep = "COMPLETE";
+    } else {
+      nextStep = expectedAfter.expectedStep;
+      nextAttempt = expectedAfter.expectedAttempt;
+      stepStatus = nextStep === payload.step_type ? "IN_PROGRESS" : "STEP_COMPLETE";
+    }
+
+    return c.json({
+      recorded: !ingestResult.deduplicated,
+      next_step: nextStep,
+      next_attempt: nextAttempt,
+      step_status: stepStatus,
+      protocol: protocolSummary(protocol),
+      progress: `${payload.attempt_number}/${attemptGoalForStep} ${payload.step_type.toLowerCase()} attempts`
+    });
+  } catch (error) {
+    if (error instanceof ZodError) {
+      return c.json(
+        {
+          error: "Invalid request payload",
+          details: error.flatten(),
+          requestId: c.get("requestId")
+        },
+        400
+      );
+    }
+    console.error("session_step_complete_failed", {
+      requestId: c.get("requestId"),
+      userId: user.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return c.json(
+      {
+        error: "Failed to complete session step",
+        requestId: c.get("requestId")
+      },
+      500
+    );
+  }
+});
+
+app.post("/api/v1/review/event", async (c) => {
+  let user: { id: string; email: string };
+  try {
+    user = await requireClerkUser(c);
+  } catch (error) {
+    if (error instanceof Response) {
+      return error;
+    }
+    throw error;
+  }
+
+  try {
+    const payload = reviewEventSchema.parse(await c.req.json());
+    const result = await ingestReviewEvent(c.env, user.id, payload);
+    return c.json(result);
+  } catch (error) {
+    if (error instanceof ZodError) {
+      return c.json(
+        {
+          error: "Invalid request payload",
+          details: error.flatten(),
+          requestId: c.get("requestId")
+        },
+        400
+      );
+    }
+    console.error("review_event_ingest_failed", {
+      requestId: c.get("requestId"),
+      userId: user.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return c.json(
+      {
+        error: "Failed to ingest review event",
+        requestId: c.get("requestId")
+      },
+      500
+    );
+  }
+});
+
+app.post("/api/v1/session/complete", async (c) => {
+  let user: { id: string; email: string };
+  try {
+    user = await requireClerkUser(c);
+  } catch (error) {
+    if (error instanceof Response) {
+      return error;
+    }
+    throw error;
+  }
+
+  try {
+    const payload = sessionCompleteSchema.parse(await c.req.json());
+    const sql = getSql(c.env);
+    const sessionRows = await sql<{ id: string; status: SessionStatus }[]>`
+      SELECT "id", "status"::text AS "status"
+      FROM "SessionRun"
+      WHERE "id" = ${payload.session_id}
+        AND "userId" = ${user.id}
+      LIMIT 1
+    `;
+    const session = sessionRows[0];
+    if (!session) {
+      return c.json(
+        {
+          error: "Session not found",
+          requestId: c.get("requestId")
+        },
+        404
+      );
+    }
+    if (session.status !== "ACTIVE") {
+      return c.json(
+        {
+          error: "Session already completed",
+          requestId: c.get("requestId")
+        },
+        409
+      );
+    }
+
+    const endedAt = new Date();
+    await sql`
+      UPDATE "SessionRun"
+      SET
+        "status" = ${"COMPLETED"}::"SessionStatus",
+        "endedAt" = ${endedAt},
+        "updatedAt" = ${endedAt}
+      WHERE "id" = ${payload.session_id}
+        AND "userId" = ${user.id}
+    `;
+
+    const reviewEvents = await sql<{ success: boolean | null; durationSeconds: number | null }[]>`
+      SELECT "success", "durationSeconds"
+      FROM "ReviewEvent"
+      WHERE "userId" = ${user.id}
+        AND "sessionRunId" = ${payload.session_id}
+        AND "eventType" = ${"REVIEW_ATTEMPTED"}::"ReviewEventType"
+    `;
+    const reviewsTotal = reviewEvents.length;
+    const reviewsSuccessful = reviewEvents.filter((event) => Boolean(event.success)).length;
+    const retentionScore = reviewsTotal > 0 ? reviewsSuccessful / reviewsTotal : 1;
+    const durationSecondsTotal = reviewEvents.reduce(
+      (acc, event) => acc + (event.durationSeconds ?? 0),
+      0
+    );
+    const minutesTotal = Math.ceil(durationSecondsTotal / 60);
+
+    const todayStart = startOfUtcDay(endedAt);
+    const newAyahsRows = await sql<{ count: string }[]>`
+      SELECT COUNT(*)::text AS "count"
+      FROM "UserItemState"
+      WHERE "userId" = ${user.id}
+        AND "firstMemorizedAt" >= ${todayStart}
+    `;
+    const newAyahsMemorized = Number(newAyahsRows[0]?.count ?? "0");
+
+    const queue = await getTodayQueue(c.env, user.id, endedAt);
+    if (queue.mode === "FLUENCY_GATE_REQUIRED") {
+      return c.json(
+        {
+          error: "Queue is blocked by fluency gate",
+          requestId: c.get("requestId")
+        },
+        409
+      );
+    }
+
+    await sql`
+      INSERT INTO "DailySession"
+        (
+          "id", "userId", "sessionDate", "mode", "retentionScore", "backlogMinutesEstimate",
+          "overdueDaysMax", "minutesTotal", "reviewsTotal", "reviewsSuccessful",
+          "newAyahsMemorized", "warmupPassed", "sabaqAllowed", "updatedAt"
+        )
+      VALUES
+        (
+          ${crypto.randomUUID()},
+          ${user.id},
+          ${todayStart},
+          ${queue.mode}::"QueueMode",
+          ${retentionScore},
+          ${queue.debt.backlogMinutesEstimate},
+          ${queue.debt.overdueDaysMax},
+          ${minutesTotal},
+          ${reviewsTotal},
+          ${reviewsSuccessful},
+          ${newAyahsMemorized},
+          ${queue.warmup_test.passed},
+          ${queue.sabaq_task.allowed},
+          ${endedAt}
+        )
+      ON CONFLICT ("userId", "sessionDate")
+      DO UPDATE SET
+        "mode" = EXCLUDED."mode",
+        "retentionScore" = EXCLUDED."retentionScore",
+        "backlogMinutesEstimate" = EXCLUDED."backlogMinutesEstimate",
+        "overdueDaysMax" = EXCLUDED."overdueDaysMax",
+        "minutesTotal" = "DailySession"."minutesTotal" + EXCLUDED."minutesTotal",
+        "reviewsTotal" = "DailySession"."reviewsTotal" + EXCLUDED."reviewsTotal",
+        "reviewsSuccessful" = "DailySession"."reviewsSuccessful" + EXCLUDED."reviewsSuccessful",
+        "newAyahsMemorized" = EXCLUDED."newAyahsMemorized",
+        "warmupPassed" = EXCLUDED."warmupPassed",
+        "sabaqAllowed" = EXCLUDED."sabaqAllowed",
+        "updatedAt" = EXCLUDED."updatedAt"
+    `;
+
+    await sql`
+      UPDATE "SessionRun"
+      SET
+        "minutesTotal" = ${minutesTotal},
+        "updatedAt" = ${endedAt}
+      WHERE "id" = ${payload.session_id}
+        AND "userId" = ${user.id}
+    `;
+
+    return c.json({
+      session_id: payload.session_id,
+      retention_score: retentionScore,
+      backlog_minutes: queue.debt.backlogMinutesEstimate,
+      minutes_total: minutesTotal,
+      mode: queue.mode
+    });
+  } catch (error) {
+    if (error instanceof ZodError) {
+      return c.json(
+        {
+          error: "Invalid request payload",
+          details: error.flatten(),
+          requestId: c.get("requestId")
+        },
+        400
+      );
+    }
+    console.error("session_complete_failed", {
+      requestId: c.get("requestId"),
+      userId: user.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return c.json(
+      {
+        error: "Failed to complete session",
         requestId: c.get("requestId")
       },
       500
