@@ -1153,6 +1153,713 @@ async function getUserStats(env: WorkerBindings, userId: string) {
   };
 }
 
+const TOTAL_QURAN_AYAHS = 6236;
+const AYAHS_IN_FIRST_JUZ_APPROX = 148;
+const CHECKPOINT_LABELS = ["4h", "8h", "1d", "3d", "7d", "14d", "30d", "90d"] as const;
+
+function toDate(value: Date | string): Date {
+  return value instanceof Date ? value : new Date(value);
+}
+
+function isoDay(value: Date | string): string {
+  return toDate(value).toISOString().slice(0, 10);
+}
+
+function monthWindow(month?: string) {
+  const now = new Date();
+  const currentYear = now.getUTCFullYear();
+  const currentMonth = now.getUTCMonth() + 1;
+  const match = month?.match(/^(\d{4})-(\d{2})$/);
+
+  const parsedYear = match ? Number(match[1]) : currentYear;
+  const parsedMonth = match ? Number(match[2]) : currentMonth;
+
+  const year = Number.isFinite(parsedYear) ? parsedYear : currentYear;
+  const monthNumber = Number.isFinite(parsedMonth) ? parsedMonth : currentMonth;
+  const safeMonth = Math.min(Math.max(monthNumber, 1), 12);
+
+  const start = new Date(Date.UTC(year, safeMonth - 1, 1));
+  const end = new Date(Date.UTC(year, safeMonth, 0, 23, 59, 59, 999));
+  const daysInMonth = new Date(Date.UTC(year, safeMonth, 0)).getUTCDate();
+  const monthKey = `${year}-${safeMonth.toString().padStart(2, "0")}`;
+
+  return {
+    month: monthKey,
+    year,
+    monthNumber: safeMonth,
+    daysInMonth,
+    start,
+    end
+  };
+}
+
+function streakStats(sessionDates: Array<Date | string>, now = new Date()) {
+  if (sessionDates.length === 0) {
+    return { current: 0, best: 0 };
+  }
+
+  const dayEpochs = sessionDates
+    .map((date) => Math.floor(startOfUtcDay(toDate(date)).getTime() / 86400000))
+    .sort((a, b) => a - b);
+  const uniqueEpochs = Array.from(new Set(dayEpochs));
+  const epochSet = new Set(uniqueEpochs);
+
+  let best = 0;
+  let run = 0;
+  let prev: number | null = null;
+  for (const epoch of uniqueEpochs) {
+    if (prev !== null && epoch === prev + 1) {
+      run += 1;
+    } else {
+      run = 1;
+    }
+    if (run > best) {
+      best = run;
+    }
+    prev = epoch;
+  }
+
+  const todayEpoch = Math.floor(startOfUtcDay(now).getTime() / 86400000);
+  const latestEpoch = uniqueEpochs[uniqueEpochs.length - 1];
+  if (todayEpoch - latestEpoch > 1) {
+    return { current: 0, best };
+  }
+
+  let current = 0;
+  let cursor = latestEpoch;
+  while (epochSet.has(cursor)) {
+    current += 1;
+    cursor -= 1;
+  }
+
+  return { current, best };
+}
+
+function xpForDay(params: {
+  minutesTotal: number;
+  reviewsSuccessful: number;
+  newAyahsMemorized: number;
+}) {
+  return params.minutesTotal * 2 + params.reviewsSuccessful + params.newAyahsMemorized * 10;
+}
+
+function roundPercent(value: number): number {
+  return Math.round(value * 1000) / 10;
+}
+
+function levelTitle(level: number): string {
+  if (level >= 20) {
+    return "Radiant Hafiz";
+  }
+  if (level >= 12) {
+    return "Dawn Master";
+  }
+  if (level >= 6) {
+    return "Dawn Apprentice";
+  }
+  return "Dawn Novice";
+}
+
+type BadgeRarity = "Common" | "Rare" | "Epic" | "Legendary";
+
+function buildBadge(input: {
+  id: string;
+  name: string;
+  description: string;
+  rarity: BadgeRarity;
+  current: number;
+  target: number;
+  unlockedAt?: Date | string | null;
+}) {
+  const unlocked = input.current >= input.target;
+  const remaining = Math.max(0, input.target - input.current);
+  const unlockedAt = input.unlockedAt ? toDate(input.unlockedAt).toISOString() : null;
+  return {
+    id: input.id,
+    name: input.name,
+    description: input.description,
+    rarity: input.rarity,
+    unlocked,
+    current: input.current,
+    target: input.target,
+    progress_percent: Math.min(100, Math.round((input.current / input.target) * 100)),
+    unlocked_at: unlocked ? unlockedAt : null,
+    requirement: unlocked ? null : `${remaining} to go`
+  };
+}
+
+function isConsecutiveDays(sessions: Array<{ sessionDate: Date | string }>): boolean {
+  if (sessions.length === 0) {
+    return false;
+  }
+  for (let index = 1; index < sessions.length; index += 1) {
+    const previous = startOfUtcDay(toDate(sessions[index - 1].sessionDate)).getTime();
+    const current = startOfUtcDay(toDate(sessions[index].sessionDate)).getTime();
+    if (current - previous !== 86400000) {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function getUserCalendar(env: WorkerBindings, userId: string, month?: string) {
+  const sql = getSql(env);
+  const window = monthWindow(month);
+  const now = new Date();
+  const currentYear = now.getUTCFullYear();
+  const currentMonth = now.getUTCMonth() + 1;
+
+  const sessions = await sql<{
+    sessionDate: Date | string;
+    minutesTotal: number;
+    newAyahsMemorized: number;
+    reviewsTotal: number;
+    reviewsSuccessful: number;
+    mode: QueueMode;
+  }[]>`
+    SELECT
+      "sessionDate",
+      "minutesTotal",
+      "newAyahsMemorized",
+      "reviewsTotal",
+      "reviewsSuccessful",
+      "mode"::text AS "mode"
+    FROM "DailySession"
+    WHERE "userId" = ${userId}
+      AND "sessionDate" >= ${window.start}
+      AND "sessionDate" <= ${window.end}
+    ORDER BY "sessionDate" ASC
+  `;
+
+  const sessionByDay = new Map<string, (typeof sessions)[number]>();
+  for (const session of sessions) {
+    sessionByDay.set(isoDay(session.sessionDate), session);
+  }
+
+  const days: Array<{
+    date: string;
+    completed: boolean;
+    minutes_total: number;
+    ayahs_memorized: number;
+    reviews_total: number;
+    reviews_successful: number;
+    xp: number;
+    mode: QueueMode | null;
+  }> = [];
+
+  for (let day = 1; day <= window.daysInMonth; day += 1) {
+    const date = new Date(Date.UTC(window.year, window.monthNumber - 1, day));
+    const key = isoDay(date);
+    const session = sessionByDay.get(key);
+    if (!session) {
+      days.push({
+        date: key,
+        completed: false,
+        minutes_total: 0,
+        ayahs_memorized: 0,
+        reviews_total: 0,
+        reviews_successful: 0,
+        xp: 0,
+        mode: null
+      });
+      continue;
+    }
+
+    days.push({
+      date: key,
+      completed: true,
+      minutes_total: session.minutesTotal,
+      ayahs_memorized: session.newAyahsMemorized,
+      reviews_total: session.reviewsTotal,
+      reviews_successful: session.reviewsSuccessful,
+      xp: xpForDay({
+        minutesTotal: session.minutesTotal,
+        reviewsSuccessful: session.reviewsSuccessful,
+        newAyahsMemorized: session.newAyahsMemorized
+      }),
+      mode: session.mode
+    });
+  }
+
+  const totals = days.reduce(
+    (acc, day) => ({
+      total_minutes: acc.total_minutes + day.minutes_total,
+      total_ayahs: acc.total_ayahs + day.ayahs_memorized,
+      total_xp: acc.total_xp + day.xp,
+      active_days: acc.active_days + (day.completed ? 1 : 0)
+    }),
+    {
+      total_minutes: 0,
+      total_ayahs: 0,
+      total_xp: 0,
+      active_days: 0
+    }
+  );
+
+  let trackedDaysInMonth = 0;
+  if (window.year === currentYear && window.monthNumber === currentMonth) {
+    trackedDaysInMonth = now.getUTCDate();
+  } else if (
+    window.year < currentYear ||
+    (window.year === currentYear && window.monthNumber < currentMonth)
+  ) {
+    trackedDaysInMonth = window.daysInMonth;
+  }
+  const missedDays = Math.max(0, trackedDaysInMonth - totals.active_days);
+
+  const streakDates = await sql<{ sessionDate: Date | string }[]>`
+    SELECT "sessionDate"
+    FROM "DailySession"
+    WHERE "userId" = ${userId}
+      AND "minutesTotal" > 0
+    ORDER BY "sessionDate" ASC
+  `;
+  const streak = streakStats(streakDates.map((entry) => entry.sessionDate), now);
+
+  return {
+    month: window.month,
+    timezone: "UTC" as const,
+    days,
+    summary: {
+      ...totals,
+      tracked_days_in_month: trackedDaysInMonth,
+      missed_days: missedDays,
+      current_streak: streak.current,
+      best_streak: streak.best
+    }
+  };
+}
+
+async function getUserAchievements(env: WorkerBindings, userId: string) {
+  const sql = getSql(env);
+
+  const [userRows, itemsTrackedRows, memorizedAyahsRows, transitionTotalsRows, allTransitions, dayStats, firstMemorizedRows] =
+    await Promise.all([
+      sql<{ fluencyScore: number | null; fluencyGatePassed: boolean }[]>`
+        SELECT "fluencyScore", "fluencyGatePassed"
+        FROM "User"
+        WHERE "id" = ${userId}
+        LIMIT 1
+      `,
+      sql<{ count: string }[]>`
+        SELECT COUNT(*)::text AS "count"
+        FROM "UserItemState"
+        WHERE "userId" = ${userId}
+      `,
+      sql<{ count: string }[]>`
+        SELECT COUNT(*)::text AS "count"
+        FROM "UserItemState"
+        WHERE "userId" = ${userId}
+          AND "firstMemorizedAt" IS NOT NULL
+      `,
+      sql<{ attemptCount: string; successCount: string }[]>`
+        SELECT
+          COALESCE(SUM("attemptCount"), 0)::text AS "attemptCount",
+          COALESCE(SUM("successCount"), 0)::text AS "successCount"
+        FROM "TransitionScore"
+        WHERE "userId" = ${userId}
+      `,
+      sql<{ successCount: number; attemptCount: number }[]>`
+        SELECT "successCount", "attemptCount"
+        FROM "TransitionScore"
+        WHERE "userId" = ${userId}
+          AND "attemptCount" >= 3
+      `,
+      sql<{
+        sessionDate: Date | string;
+        retentionScore: number;
+        minutesTotal: number;
+        reviewsSuccessful: number;
+        newAyahsMemorized: number;
+      }[]>`
+        SELECT
+          "sessionDate",
+          "retentionScore",
+          "minutesTotal",
+          "reviewsSuccessful",
+          "newAyahsMemorized"
+        FROM "DailySession"
+        WHERE "userId" = ${userId}
+          AND "minutesTotal" > 0
+        ORDER BY "sessionDate" ASC
+      `,
+      sql<{ firstMemorizedAt: Date | string }[]>`
+        SELECT "firstMemorizedAt"
+        FROM "UserItemState"
+        WHERE "userId" = ${userId}
+          AND "firstMemorizedAt" IS NOT NULL
+        ORDER BY "firstMemorizedAt" ASC
+        LIMIT 1
+      `
+    ]);
+
+  const user = userRows[0];
+  if (!user) {
+    throw new Error("User not found");
+  }
+
+  const itemsTracked = Number(itemsTrackedRows[0]?.count ?? "0");
+  const memorizedAyahs = Number(memorizedAyahsRows[0]?.count ?? "0");
+  const transitionAttemptCount = Number(transitionTotalsRows[0]?.attemptCount ?? "0");
+  const transitionSuccessCount = Number(transitionTotalsRows[0]?.successCount ?? "0");
+  const weakTransitionCount = allTransitions.filter(
+    (transition) => transition.successCount / transition.attemptCount < 0.7
+  ).length;
+  const streak = streakStats(dayStats.map((entry) => entry.sessionDate));
+  const latestSeven = dayStats.slice(-7);
+  const perfectWeek =
+    latestSeven.length === 7 &&
+    latestSeven.every((day) => day.retentionScore >= 0.99) &&
+    isConsecutiveDays(latestSeven);
+
+  const totals = dayStats.reduce(
+    (acc, day) => ({
+      minutes: acc.minutes + day.minutesTotal,
+      reviewsSuccessful: acc.reviewsSuccessful + day.reviewsSuccessful,
+      newAyahs: acc.newAyahs + day.newAyahsMemorized
+    }),
+    {
+      minutes: 0,
+      reviewsSuccessful: 0,
+      newAyahs: 0
+    }
+  );
+
+  const xp =
+    totals.minutes * 2 +
+    totals.reviewsSuccessful +
+    totals.newAyahs * 10 +
+    transitionAttemptCount;
+  const level = Math.floor(xp / 250) + 1;
+  const xpNext = level * 250;
+  const title = levelTitle(level);
+
+  const badges = [
+    buildBadge({
+      id: "streak_master",
+      name: "Streak Master",
+      description: "Maintain a 7-day streak",
+      rarity: "Common",
+      current: streak.best,
+      target: 7
+    }),
+    buildBadge({
+      id: "first_ayah",
+      name: "First Ayah",
+      description: "Memorize your first ayah",
+      rarity: "Common",
+      current: memorizedAyahs,
+      target: 1,
+      unlockedAt: firstMemorizedRows[0]?.firstMemorizedAt ?? null
+    }),
+    buildBadge({
+      id: "juz_done",
+      name: "Juz Done",
+      description: "Complete first Juz",
+      rarity: "Rare",
+      current: memorizedAyahs,
+      target: AYAHS_IN_FIRST_JUZ_APPROX
+    }),
+    buildBadge({
+      id: "perfect_week",
+      name: "Perfect Week",
+      description: "7 consecutive days at perfect retention",
+      rarity: "Rare",
+      current: perfectWeek ? 1 : 0,
+      target: 1
+    }),
+    buildBadge({
+      id: "rare_gem",
+      name: "Rare Gem",
+      description: "Score 100 on fluency gate",
+      rarity: "Epic",
+      current: user.fluencyScore ?? 0,
+      target: 100
+    }),
+    buildBadge({
+      id: "chain_builder",
+      name: "Chain Builder",
+      description: "Track 100 verse transitions",
+      rarity: "Common",
+      current: transitionAttemptCount,
+      target: 100
+    }),
+    buildBadge({
+      id: "streak_30",
+      name: "30-Day Streak",
+      description: "Maintain a 30-day streak",
+      rarity: "Epic",
+      current: streak.best,
+      target: 30
+    }),
+    buildBadge({
+      id: "half_quran",
+      name: "Half Quran",
+      description: "Memorize 15 Juz",
+      rarity: "Legendary",
+      current: memorizedAyahs,
+      target: Math.ceil(TOTAL_QURAN_AYAHS / 2)
+    }),
+    buildBadge({
+      id: "full_quran",
+      name: "Full Quran",
+      description: "Memorize all 30 Juz",
+      rarity: "Legendary",
+      current: memorizedAyahs,
+      target: TOTAL_QURAN_AYAHS
+    })
+  ];
+
+  const unlockedBadges = badges.filter((badge) => badge.unlocked);
+  const lockedBadges = badges.filter((badge) => !badge.unlocked);
+  const nextMilestone = lockedBadges[0] ?? null;
+
+  return {
+    level,
+    title,
+    xp,
+    xp_next: xpNext,
+    unlocked_count: unlockedBadges.length,
+    total_badges: badges.length,
+    badges,
+    recent_achievements: unlockedBadges.slice(0, 3),
+    next_milestone: nextMilestone
+      ? {
+          id: nextMilestone.id,
+          name: nextMilestone.name,
+          requirement: nextMilestone.requirement
+        }
+      : null,
+    metrics: {
+      current_streak: streak.current,
+      best_streak: streak.best,
+      items_tracked: itemsTracked,
+      memorized_ayahs: memorizedAyahs,
+      transition_attempts: transitionAttemptCount,
+      transition_success_rate:
+        transitionAttemptCount > 0
+          ? roundPercent(transitionSuccessCount / transitionAttemptCount)
+          : 0,
+      weak_transition_count: weakTransitionCount,
+      fluency_score: user.fluencyScore,
+      fluency_gate_passed: user.fluencyGatePassed
+    }
+  };
+}
+
+async function getUserProgress(env: WorkerBindings, userId: string) {
+  const sql = getSql(env);
+  const [stats, transitions, states, dailySessions] = await Promise.all([
+    getUserStats(env, userId),
+    sql<{
+      fromAyahId: number;
+      toAyahId: number;
+      successCount: number;
+      attemptCount: number;
+      fromSurahNumber: number;
+      fromAyahNumber: number;
+      toSurahNumber: number;
+      toAyahNumber: number;
+    }[]>`
+      SELECT
+        t."fromAyahId",
+        t."toAyahId",
+        t."successCount",
+        t."attemptCount",
+        af."surahNumber" AS "fromSurahNumber",
+        af."ayahNumber" AS "fromAyahNumber",
+        at."surahNumber" AS "toSurahNumber",
+        at."ayahNumber" AS "toAyahNumber"
+      FROM "TransitionScore" t
+      JOIN "Ayah" af ON af."id" = t."fromAyahId"
+      JOIN "Ayah" at ON at."id" = t."toAyahId"
+      WHERE t."userId" = ${userId}
+    `,
+    sql<{
+      intervalCheckpointIndex: number;
+      successfulReviews: number;
+      totalReviews: number;
+    }[]>`
+      SELECT
+        "intervalCheckpointIndex",
+        "successfulReviews",
+        "totalReviews"
+      FROM "UserItemState"
+      WHERE "userId" = ${userId}
+    `,
+    sql<{
+      sessionDate: Date | string;
+      minutesTotal: number;
+      newAyahsMemorized: number;
+      reviewsSuccessful: number;
+    }[]>`
+      SELECT
+        "sessionDate",
+        "minutesTotal",
+        "newAyahsMemorized",
+        "reviewsSuccessful"
+      FROM "DailySession"
+      WHERE "userId" = ${userId}
+      ORDER BY "sessionDate" DESC
+      LIMIT 30
+    `
+  ]);
+
+  const weakTransitions = transitions
+    .filter(
+      (transition) =>
+        transition.attemptCount >= 3 &&
+        transition.successCount / transition.attemptCount < 0.7
+    )
+    .map((transition) => ({
+      from_ayah_id: transition.fromAyahId,
+      to_ayah_id: transition.toAyahId,
+      from_label: `${transition.fromSurahNumber}:${transition.fromAyahNumber}`,
+      to_label: `${transition.toSurahNumber}:${transition.toAyahNumber}`,
+      success_rate: roundPercent(transition.successCount / transition.attemptCount),
+      success_count: transition.successCount,
+      attempt_count: transition.attemptCount
+    }))
+    .sort((a, b) => a.success_rate - b.success_rate)
+    .slice(0, 10);
+
+  const strongTransitions = transitions
+    .filter(
+      (transition) =>
+        transition.attemptCount >= 3 &&
+        transition.successCount / transition.attemptCount >= 0.9
+    )
+    .map((transition) => ({
+      from_ayah_id: transition.fromAyahId,
+      to_ayah_id: transition.toAyahId,
+      from_label: `${transition.fromSurahNumber}:${transition.fromAyahNumber}`,
+      to_label: `${transition.toSurahNumber}:${transition.toAyahNumber}`,
+      success_rate: roundPercent(transition.successCount / transition.attemptCount),
+      attempt_count: transition.attemptCount
+    }))
+    .sort((a, b) => b.success_rate - a.success_rate)
+    .slice(0, 5);
+
+  const transitionTotals = transitions.reduce(
+    (acc, transition) => ({
+      success: acc.success + transition.successCount,
+      attempts: acc.attempts + transition.attemptCount
+    }),
+    {
+      success: 0,
+      attempts: 0
+    }
+  );
+
+  const checkpointTotals = CHECKPOINT_LABELS.map((label, index) => ({
+    checkpoint: label,
+    interval_seconds: SRS_CHECKPOINTS_SECONDS[index],
+    items_count: 0,
+    success_sum: 0,
+    total_sum: 0
+  }));
+
+  for (const state of states) {
+    const index = Math.min(
+      Math.max(state.intervalCheckpointIndex, 0),
+      checkpointTotals.length - 1
+    );
+    checkpointTotals[index].items_count += 1;
+    checkpointTotals[index].success_sum += state.successfulReviews;
+    checkpointTotals[index].total_sum += state.totalReviews;
+  }
+
+  const checkpointRows = checkpointTotals.map((entry) => ({
+    checkpoint: entry.checkpoint,
+    interval_seconds: entry.interval_seconds,
+    items_count: entry.items_count,
+    success_rate:
+      entry.total_sum > 0 ? roundPercent(entry.success_sum / entry.total_sum) : null
+  }));
+
+  const knownRates = checkpointRows
+    .map((entry) => entry.success_rate)
+    .filter((value): value is number => value !== null);
+  const overallRate =
+    knownRates.length > 0
+      ? roundPercent(knownRates.reduce((acc, value) => acc + value, 0) / knownRates.length / 100)
+      : null;
+
+  const sevenDay = checkpointRows.find((entry) => entry.checkpoint === "7d");
+  let recommendation = "Keep consistency and protect review debt before adding new load.";
+  if (
+    typeof sevenDay?.success_rate === "number" &&
+    overallRate !== null &&
+    sevenDay.success_rate + 5 < overallRate
+  ) {
+    recommendation =
+      "Add focused reviews around the 7-day checkpoint to reduce mid-interval forgetting.";
+  } else if (weakTransitions.length >= 5) {
+    recommendation =
+      "Schedule a Link Repair session: your weak transitions are high enough to affect flow.";
+  }
+
+  const activityDays = dailySessions
+    .slice()
+    .reverse()
+    .map((day) => ({
+      date: isoDay(day.sessionDate),
+      minutes_total: day.minutesTotal,
+      ayahs_memorized: day.newAyahsMemorized,
+      xp: xpForDay({
+        minutesTotal: day.minutesTotal,
+        reviewsSuccessful: day.reviewsSuccessful,
+        newAyahsMemorized: day.newAyahsMemorized
+      }),
+      completed: day.minutesTotal > 0 || day.newAyahsMemorized > 0
+    }));
+
+  const activitySummary = activityDays.reduce(
+    (acc, day) => ({
+      active_days: acc.active_days + (day.completed ? 1 : 0),
+      avg_minutes: acc.avg_minutes + day.minutes_total
+    }),
+    {
+      active_days: 0,
+      avg_minutes: 0
+    }
+  );
+  const averageMinutes =
+    activityDays.length > 0
+      ? Math.round(activitySummary.avg_minutes / activityDays.length)
+      : 0;
+
+  return {
+    overview: {
+      total_items_tracked: stats.total_items_tracked,
+      due_items: stats.due_items,
+      completed_sessions: stats.completed_sessions,
+      retention_percent: stats.latest_daily_session
+        ? roundPercent(stats.latest_daily_session.retentionScore)
+        : 0
+    },
+    activity: {
+      days: activityDays,
+      active_days: activitySummary.active_days,
+      average_minutes: averageMinutes
+    },
+    transitions: {
+      overall_strength:
+        transitionTotals.attempts > 0
+          ? roundPercent(transitionTotals.success / transitionTotals.attempts)
+          : 0,
+      weak: weakTransitions,
+      strong: strongTransitions,
+      link_repair_recommended: weakTransitions.length > 5
+    },
+    retention: {
+      checkpoints: checkpointRows,
+      overall_success_rate: overallRate,
+      recommendation
+    }
+  };
+}
+
 function isPgUniqueViolation(error: unknown): boolean {
   return (
     typeof error === "object" &&
@@ -2494,6 +3201,108 @@ app.get("/api/v1/user/stats", async (c) => {
     return c.json(
       {
         error: "Failed to load user stats",
+        requestId: c.get("requestId")
+      },
+      500
+    );
+  }
+});
+
+app.get("/api/v1/user/calendar", async (c) => {
+  let user: { id: string; email: string };
+  try {
+    user = await requireClerkUser(c);
+  } catch (error) {
+    if (error instanceof Response) {
+      return error;
+    }
+    throw error;
+  }
+
+  const month = c.req.query("month");
+  if (month && !/^\d{4}-\d{2}$/.test(month)) {
+    return c.json(
+      {
+        error: "Invalid month format, expected YYYY-MM",
+        requestId: c.get("requestId")
+      },
+      400
+    );
+  }
+
+  try {
+    const payload = await getUserCalendar(c.env, user.id, month);
+    return c.json(payload);
+  } catch (error) {
+    console.error("user_calendar_failed", {
+      requestId: c.get("requestId"),
+      userId: user.id,
+      month,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return c.json(
+      {
+        error: "Failed to load user calendar",
+        requestId: c.get("requestId")
+      },
+      500
+    );
+  }
+});
+
+app.get("/api/v1/user/achievements", async (c) => {
+  let user: { id: string; email: string };
+  try {
+    user = await requireClerkUser(c);
+  } catch (error) {
+    if (error instanceof Response) {
+      return error;
+    }
+    throw error;
+  }
+
+  try {
+    const payload = await getUserAchievements(c.env, user.id);
+    return c.json(payload);
+  } catch (error) {
+    console.error("user_achievements_failed", {
+      requestId: c.get("requestId"),
+      userId: user.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return c.json(
+      {
+        error: "Failed to load achievements",
+        requestId: c.get("requestId")
+      },
+      500
+    );
+  }
+});
+
+app.get("/api/v1/user/progress", async (c) => {
+  let user: { id: string; email: string };
+  try {
+    user = await requireClerkUser(c);
+  } catch (error) {
+    if (error instanceof Response) {
+      return error;
+    }
+    throw error;
+  }
+
+  try {
+    const payload = await getUserProgress(c.env, user.id);
+    return c.json(payload);
+  } catch (error) {
+    console.error("user_progress_failed", {
+      requestId: c.get("requestId"),
+      userId: user.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return c.json(
+      {
+        error: "Failed to load progress",
         requestId: c.get("requestId")
       },
       500
